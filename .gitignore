@@ -1,0 +1,21 @@
+# Arduino/Teensy/PlatformIO artifacts & OS cruft
+*.hex
+*.elf
+*.bin
+*.eep
+*.map
+*.d
+*.o
+*.a
+*.log
+*.tmp
+*.bak
+
+# IDE/Editor metadata
+.vscode/
+.idea/
+.DS_Store
+
+# Arduino CLI cache (if you also use it)
+.arduino/
+arduino-cli.yaml

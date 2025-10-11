@@ -1,0 +1,300 @@
+#pragma once
+/*
+   Logging.h — Tri-state CSV logging + SD browsing for Teensy 4.1
+   Upgrades:
+     • Public modeName() (fixes linker err when called from main)
+     • Versioned CSV header line with schema meta
+     • Log levels: BASIC(0), DETAIL(1), DEBUG(2)  → filter row verbosity
+     • Size-based rollover: auto-rotate to next /LOGxxx.CSV once MAX_BYTES reached
+*/
+
+#include <Arduino.h>
+#include <Streaming.h>
+#include <SD.h>
+
+namespace Log {
+
+// ----------------------- Modes & Levels -----------------------------
+enum Mode  : uint8_t { SERIAL_ONLY = 0, SD_ONLY = 1, BOTH = 2 };
+enum Level : uint8_t { BASIC = 0, DETAIL = 1, DEBUG = 2 };
+
+// ------------------ Internal state & configuration ------------------
+static File     logFile;
+static bool     sd_ok        = false;
+static char     fname[32]    = {0};
+static uint32_t line_count   = 0;
+static const uint32_t FLUSH_EVERY = 50;
+static const int      CHIP_SELECT = BUILTIN_SDCARD;
+
+static Mode     currentMode  = SD_ONLY;   // sketch may override on boot
+static Level    currentLevel = DETAIL;    // default verbosity
+
+// rollover at ~5 MB by default
+static const uint32_t MAX_BYTES = 5 * 1024UL * 1024UL;
+
+// ---------------------- Private helpers -----------------------------
+static void pickLogName() {
+  for (int i = 0; i < 1000; ++i) {
+    snprintf(fname, sizeof(fname), "/LOG%03d.CSV", i);
+    if (!SD.exists(fname)) return;
+  }
+  snprintf(fname, sizeof(fname), "/LOG999.CSV");
+}
+
+static const char* modeNameStr() {
+  switch (currentMode) {
+    case SERIAL_ONLY: return "Serial only";
+    case SD_ONLY:     return "SD only";
+    case BOTH:        return "Both";
+    default:          return "Unknown";
+  }
+}
+
+static void startNewFile() {
+  if (!sd_ok) return;
+  if (logFile) { logFile.close(); }
+  pickLogName();
+  logFile = SD.open(fname, FILE_WRITE);
+  if (!logFile) {
+    sd_ok = false;
+    currentMode = SERIAL_ONLY;
+    Serial << "[LOG] SD open failed; switching to Serial only." << endl;
+    return;
+  }
+  // Write versioned header preamble and CSV header
+  logFile.print("# schema=v1.0, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n");
+  logFile.print("t_us,loop_us,dt_loop,read_idx,leg,joint_id,"
+                "q_meas_rad,dq_meas_rads,tempC,mV,"
+                "q_cmd_rad,q_ref_rad,e_rad,phase,u\n");
+  logFile.flush();
+  line_count = 0;
+}
+
+// ------------------------- Public API -------------------------------
+
+// Initialize SD; open a new /LOGxxx.CSV if possible.
+static void begin() {
+  Serial << "[LOG] Testing SD..." << endl;
+
+  if (SD.begin(BUILTIN_SDCARD)) {
+    sd_ok = true;
+    startNewFile();
+    if (sd_ok) Serial << "[LOG] SD ready: " << fname << endl;
+  } else {
+    sd_ok = false;
+    Serial << "[LOG] SD init failed; SD logging disabled." << endl;
+  }
+
+  // If mode requires SD but SD isn't OK, degrade to Serial
+  if (!sd_ok && (currentMode == SD_ONLY || currentMode == BOTH)) {
+    currentMode = SERIAL_ONLY;
+    Serial << "[LOG] SD unavailable → logging mode forced to Serial only." << endl;
+  }
+}
+
+static void setMode(Mode m) {
+  currentMode = m;
+  if ((m == SD_ONLY || m == BOTH) && !sd_ok) {
+    currentMode = SERIAL_ONLY;
+    Serial << "[LOG] SD not available → using Serial only." << endl;
+  } else {
+    Serial << "[LOG] Mode set to: " << modeNameStr() << endl;
+  }
+}
+
+static Mode  getMode()   { return currentMode; }
+static bool  sdReady()   { return sd_ok; }
+static Level getLevel()  { return currentLevel; }
+static void  setLevel(Level L) { currentLevel = L; }
+
+// Public-facing name (fixes main calling Log::modeName())
+static const char* modeName() { return modeNameStr(); }
+
+// Manual rotate (close current and open next)
+static void rotate() {
+  if (!sd_ok) { Serial.println("[LOG] SD not available; cannot rotate."); return; }
+  startNewFile();
+  if (sd_ok) Serial << "[LOG] Rotated to " << fname << endl;
+}
+
+// Print CSV header respecting the current mode (kept for compatibility)
+static void header() {
+  const char* h =
+    "t_us,loop_us,dt_loop,read_idx,leg,joint_id,"
+    "q_meas_rad,dq_meas_rads,tempC,mV,"
+    "q_cmd_rad,q_ref_rad,e_rad,phase,u\n";
+
+  if (currentMode == SERIAL_ONLY || currentMode == BOTH) {
+    Serial << "# schema=v1.0, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n";
+    Serial << h;
+  }
+
+  if ((currentMode == SD_ONLY || currentMode == BOTH) && sd_ok && logFile) {
+    // startNewFile() already wrote the header, but keep this idempotent
+    logFile.flush();
+  }
+}
+
+// Write one CSV row according to current mode and level
+static void row(uint32_t t_us, uint32_t loop_us, float dt_loop,
+                int read_idx, int leg_idx, uint8_t joint_id,
+                float q_meas, float dq_meas,
+                int16_t tempC, int16_t mV,
+                float q_cmd, float q_ref, float e,
+                const char* phase_str, float u)
+{
+  // Level filtering (BASIC drops some columns on Serial to stay light)
+  const bool verbose = (currentLevel >= DETAIL);
+
+  // Serial path
+  if (currentMode == SERIAL_ONLY || currentMode == BOTH) {
+    if (verbose) {
+      Serial << t_us << ',' << loop_us << ',' << dt_loop << ','
+             << read_idx << ',' << leg_idx << ',' << (int)joint_id << ','
+             << q_meas << ',' << dq_meas << ','
+             << tempC << ',' << mV << ','
+             << q_cmd << ',' << q_ref << ',' << e << ','
+             << phase_str << ',' << u << '\n';
+    } else {
+      // BASIC: timestamp, leg/joint, q_meas, q_cmd
+      Serial << t_us << ',' << leg_idx << ',' << (int)joint_id << ','
+             << q_meas << ',' << q_cmd << '\n';
+    }
+  }
+
+  // SD path
+  if ((currentMode == SD_ONLY || currentMode == BOTH) && sd_ok && logFile) {
+    // Always write full schema to SD
+    logFile.print(t_us); logFile.print(',');
+    logFile.print(loop_us); logFile.print(',');
+    logFile.print(dt_loop, 6); logFile.print(',');
+    logFile.print(read_idx); logFile.print(',');
+    logFile.print(leg_idx); logFile.print(',');
+    logFile.print((int)joint_id); logFile.print(',');
+    logFile.print(q_meas, 6); logFile.print(',');
+    logFile.print(dq_meas, 6); logFile.print(',');
+    logFile.print(tempC); logFile.print(',');
+    logFile.print(mV); logFile.print(',');
+    logFile.print(q_cmd, 6); logFile.print(',');
+    logFile.print(q_ref, 6); logFile.print(',');
+    logFile.print(e, 6); logFile.print(',');
+    logFile.print(phase_str); logFile.print(',');
+    logFile.print(u, 6); logFile.print('\n');
+
+    // Periodic flush + rollover + error degrade
+    if ((++line_count % FLUSH_EVERY) == 0) {
+      logFile.flush();
+      if (!logFile) {
+        sd_ok = false;
+        currentMode = SERIAL_ONLY;
+        Serial << "[LOG] SD write error → switching to Serial only." << endl;
+      } else if (logFile.size() >= MAX_BYTES) {
+        Serial << "[LOG] Rollover at " << logFile.size() << " bytes." << endl;
+        rotate();
+      }
+    }
+  }
+}
+
+// ------------------------- SD browsing utils ------------------------
+static void list(const char* path = "/") {
+  if (!sd_ok) { Serial.println("[LOG] SD not available. (Tip: run 'log show')"); return; }
+  File dir = SD.open(path);
+  if (!dir) { Serial.print("[LOG] Cannot open path: "); Serial.println(path); return; }
+  if (!dir.isDirectory()) { Serial.print("[LOG] Not a directory: "); Serial.println(path); dir.close(); return; }
+
+  Serial.print("[LOG] Listing '"); Serial.print(path); Serial.println("':");
+  dir.rewindDirectory();
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    Serial.print(entry.isDirectory() ? " <DIR> " : "       ");
+    Serial.print(entry.name());
+    if (!entry.isDirectory()) { Serial.print("  "); Serial.print((uint32_t)entry.size()); Serial.print(" bytes"); }
+    Serial.println();
+    entry.close();
+  }
+  dir.close();
+}
+
+static void cat(const char* path, uint32_t max_bytes = 4096) {
+  if (!sd_ok) { Serial.println("[LOG] SD not available. (Tip: run 'log show')"); return; }
+  File f = SD.open(path, FILE_READ);
+  if (!f) { Serial.print("[LOG] Cannot open file: "); Serial.println(path); return; }
+  if (f.isDirectory()) { Serial.print("[LOG] Path is a directory, not a file: "); Serial.println(path); f.close(); return; }
+
+  const uint32_t fsize = f.size();
+  uint32_t to_read = (max_bytes == 0) ? fsize : min(max_bytes, fsize);
+
+  Serial.print("[LOG] cat '"); Serial.print(path); Serial.print("' (");
+  Serial.print(to_read); Serial.print(" of "); Serial.print(fsize); Serial.println(" bytes):");
+
+  static const size_t BUFSZ = 256;
+  uint8_t buf[BUFSZ];
+  while (to_read > 0) {
+    size_t chunk = (to_read < BUFSZ) ? to_read : BUFSZ;
+    int n = f.read(buf, chunk);
+    if (n <= 0) break;
+    Serial.write(buf, n);
+    to_read -= n;
+    if (to_read % 4096 == 0) yield();
+  }
+  Serial.println();
+  f.close();
+}
+
+// Convenience wrappers preserved for compatibility with your main
+static bool listLogs() {
+  if (!sd_ok) { Serial.println("[LOG] SD not available."); return false; }
+  File root = SD.open("/");
+  if (!root) { Serial.println("[LOG] Failed to open root."); return false; }
+  Serial.println("[LOG] Files on SD (LOG*.CSV):");
+  File entry;
+  root.rewindDirectory();
+  while ((entry = root.openNextFile())) {
+    if (!entry.isDirectory()) {
+      const char* name = entry.name();
+      if (strlen(name) == 11 && strncmp(name, "LOG", 3) == 0 && strcasecmp(name + 7, ".CSV") == 0) {
+        Serial.print("  "); Serial.print(name); Serial.print("  ");
+        Serial.print((uint32_t)entry.size()); Serial.println(" bytes");
+      }
+    }
+    entry.close();
+  }
+  root.close();
+  return true;
+}
+
+static bool printLog(const char* path, uint32_t max_bytes = 0) {
+  if (!sd_ok) { Serial.println("[LOG] SD not available."); return false; }
+  File f = SD.open(path, FILE_READ);
+  if (!f) { Serial.print("[LOG] Cannot open "); Serial.println(path); return false; }
+
+  Serial.print("[LOG] Dumping "); Serial.print(path);
+  if (max_bytes) { Serial.print(" ("); Serial.print(max_bytes); Serial.println(" bytes)…"); }
+  else           { Serial.println(" (all bytes)…"); }
+
+  const size_t CHUNK = 256;
+  uint8_t buf[CHUNK];
+  uint32_t remaining = max_bytes;
+  while (true) {
+    size_t want = CHUNK;
+    if (max_bytes && remaining < want) want = remaining;
+    int n = f.read(buf, want);
+    if (n <= 0) break;
+    Serial.write(buf, n);
+    if (max_bytes) { remaining -= n; if (remaining == 0) break; }
+    yield();
+  }
+  f.close();
+  Serial.println("\n[LOG] End of file.");
+  return true;
+}
+
+static bool printLogIndex(int idx, uint32_t max_bytes = 0) {
+  if (idx < 0 || idx > 999) { Serial.println("[LOG] Index out of range (0..999)"); return false; }
+  char path[16]; snprintf(path, sizeof(path), "/LOG%03d.CSV", idx);
+  return printLog(path, max_bytes);
+}
+
+} // namespace Log
