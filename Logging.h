@@ -11,11 +11,13 @@
 #include <Arduino.h>
 #include <Streaming.h>
 #include <SD.h>
+#include <strings.h> // for strcasecmp (POSIX)
+#include "Config.h"
 
 namespace Log {
 
 // ----------------------- Modes & Levels -----------------------------
-enum Mode  : uint8_t { SERIAL_ONLY = 0, SD_ONLY = 1, BOTH = 2 };
+enum Mode  : uint8_t { SERIAL_ONLY = 0, SD_ONLY = 1, BOTH = 2, NONE = 3 };
 enum Level : uint8_t { BASIC = 0, DETAIL = 1, DEBUG = 2 };
 
 // ------------------ Internal state & configuration ------------------
@@ -31,6 +33,7 @@ static Level    currentLevel = DETAIL;    // default verbosity
 
 // rollover at ~5 MB by default
 static const uint32_t MAX_BYTES = 5 * 1024UL * 1024UL;
+// Unified configuration now stored in /config.txt (see Config.h)
 
 // ---------------------- Private helpers -----------------------------
 static void pickLogName() {
@@ -46,6 +49,7 @@ static const char* modeNameStr() {
     case SERIAL_ONLY: return "Serial only";
     case SD_ONLY:     return "SD only";
     case BOTH:        return "Both";
+    case NONE:        return "Off";
     default:          return "Unknown";
   }
 }
@@ -61,10 +65,10 @@ static void startNewFile() {
     Serial << "[LOG] SD open failed; switching to Serial only." << endl;
     return;
   }
-  // Write versioned header preamble and CSV header
-  logFile.print("# schema=v1.0, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n");
+  // Write versioned header preamble and CSV header (includes estimates)
+  logFile.print("# schema=v1.1, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n");
   logFile.print("t_us,loop_us,dt_loop,read_idx,leg,joint_id,"
-                "q_meas_rad,dq_meas_rads,tempC,mV,"
+                "q_meas_rad,dq_meas_rads,q_est_rad,dq_est_rads,tempC,mV,"
                 "q_cmd_rad,q_ref_rad,e_rad,phase,u\n");
   logFile.flush();
   line_count = 0;
@@ -93,6 +97,15 @@ static void begin() {
 }
 
 static void setMode(Mode m) {
+  // Close file if turning logging off
+  if (m == NONE) {
+    if (logFile) { logFile.close(); }
+    fname[0] = 0;
+    currentMode = NONE;
+    Serial << "[LOG] Mode set to: " << modeNameStr() << endl;
+    return;
+  }
+
   currentMode = m;
   if ((m == SD_ONLY || m == BOTH) && !sd_ok) {
     currentMode = SERIAL_ONLY;
@@ -109,6 +122,88 @@ static void  setLevel(Level L) { currentLevel = L; }
 
 // Public-facing name (fixes main calling Log::modeName())
 static const char* modeName() { return modeNameStr(); }
+// Current log file path (if any); returns "(none)" if not opened yet.
+static const char* currentFile() { return fname[0] ? fname : "(none)"; }
+
+// ------------------------- Delete utilities ------------------------
+// Safety notes:
+//  - Only delete files that match LOG*.CSV (case-insensitive .CSV ok).
+//  - Never delete the current file in use.
+//  - Paths may be absolute ("/LOG000.CSV") or bare ("LOG000.CSV").
+
+static bool isLogName(const char* name) {
+  if (!name) return false;
+  // Accept forms: LOG###.CSV with 3+ digits; be lenient on length
+  if (strncmp(name, "LOG", 3) != 0) return false;
+  const char* dot = strrchr(name, '.');
+  if (!dot) return false;
+  // Case-insensitive compare for extension
+  return strcasecmp(dot, ".CSV") == 0;
+}
+
+static void normalizePath(const char* in, char* out, size_t outsz) {
+  if (!in || !out || outsz == 0) return;
+  if (in[0] == '/') snprintf(out, outsz, "%s", in);
+  else              snprintf(out, outsz, "/%s", in);
+}
+
+// Delete a single log file; returns true if removed.
+static bool del(const char* path) {
+  if (!sd_ok) { Serial.println("[LOG] SD not available."); return false; }
+  if (!path || !*path) { Serial.println("[LOG] del: missing path"); return false; }
+
+  char pbuf[32]; normalizePath(path, pbuf, sizeof(pbuf));
+
+  // Extract name portion for validation
+  const char* name = pbuf;
+  if (pbuf[0] == '/') name = pbuf + 1;
+
+  if (!isLogName(name)) { Serial.println("[LOG] del: only LOG*.CSV may be deleted"); return false; }
+
+  // Do not delete the current file in use
+  if (fname[0] && strcasecmp(pbuf, fname) == 0) {
+    Serial.print("[LOG] del: refusing to delete current file: "); Serial.println(fname);
+    return false;
+  }
+
+  if (!SD.exists(pbuf)) { Serial.print("[LOG] del: not found: "); Serial.println(pbuf); return false; }
+
+  bool ok = SD.remove(pbuf);
+  Serial.print("[LOG] del "); Serial.print(pbuf); Serial.println(ok ? " : OK" : " : FAILED");
+  return ok;
+}
+
+// Delete all LOG*.CSV files in root, excluding current file if excludeCurrent=true.
+// Returns the count of files successfully deleted.
+static int delAll(bool excludeCurrent = true) {
+  if (!sd_ok) { Serial.println("[LOG] SD not available."); return 0; }
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) { Serial.println("[LOG] Cannot open root directory."); return 0; }
+
+  int count = 0;
+  File entry;
+  root.rewindDirectory();
+  while ((entry = root.openNextFile())) {
+    if (!entry.isDirectory()) {
+      const char* name = entry.name();
+      // Build absolute path for compare/remove
+      char apath[32]; snprintf(apath, sizeof(apath), "/%s", name);
+
+      bool isLog = isLogName(name);
+      bool isCurrent = (excludeCurrent && fname[0] && strcasecmp(apath, fname) == 0);
+      entry.close();
+
+      if (isLog && !isCurrent) {
+        if (SD.remove(apath)) { ++count; }
+      }
+    } else {
+      entry.close();
+    }
+  }
+  root.close();
+  Serial.print("[LOG] delall: deleted "); Serial.print(count); Serial.println(" file(s)");
+  return count;
+}
 
 // Manual rotate (close current and open next)
 static void rotate() {
@@ -121,11 +216,11 @@ static void rotate() {
 static void header() {
   const char* h =
     "t_us,loop_us,dt_loop,read_idx,leg,joint_id,"
-    "q_meas_rad,dq_meas_rads,tempC,mV,"
+    "q_meas_rad,dq_meas_rads,q_est_rad,dq_est_rads,tempC,mV,"
     "q_cmd_rad,q_ref_rad,e_rad,phase,u\n";
 
   if (currentMode == SERIAL_ONLY || currentMode == BOTH) {
-    Serial << "# schema=v1.0, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n";
+    Serial << "# schema=v1.1, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n";
     Serial << h;
   }
 
@@ -138,27 +233,31 @@ static void header() {
 // Write one CSV row according to current mode and level
 static void row(uint32_t t_us, uint32_t loop_us, float dt_loop,
                 int read_idx, int leg_idx, uint8_t joint_id,
-                float q_meas, float dq_meas,
+                float q_meas, float dq_meas, float q_est, float dq_est,
                 int16_t tempC, int16_t mV,
                 float q_cmd, float q_ref, float e,
                 const char* phase_str, float u)
 {
+  if (currentMode == NONE) {
+    return; // logging fully disabled
+  }
   // Level filtering (BASIC drops some columns on Serial to stay light)
   const bool verbose = (currentLevel >= DETAIL);
 
   // Serial path
   if (currentMode == SERIAL_ONLY || currentMode == BOTH) {
     if (verbose) {
-      Serial << t_us << ',' << loop_us << ',' << dt_loop << ','
+        Serial << t_us << ',' << loop_us << ',' << _FLOAT(dt_loop, 8) << ','
              << read_idx << ',' << leg_idx << ',' << (int)joint_id << ','
-             << q_meas << ',' << dq_meas << ','
+                << _FLOAT(q_meas, 8) << ',' << _FLOAT(dq_meas, 8) << ','
+             << _FLOAT(q_est, 8) << ',' << _FLOAT(dq_est, 8) << ','
              << tempC << ',' << mV << ','
-             << q_cmd << ',' << q_ref << ',' << e << ','
+                << _FLOAT(q_cmd, 8) << ',' << _FLOAT(q_ref, 8) << ',' << _FLOAT(e, 8) << ','
              << phase_str << ',' << u << '\n';
     } else {
       // BASIC: timestamp, leg/joint, q_meas, q_cmd
       Serial << t_us << ',' << leg_idx << ',' << (int)joint_id << ','
-             << q_meas << ',' << q_cmd << '\n';
+               << _FLOAT(q_meas, 8) << ',' << _FLOAT(q_cmd, 8) << '\n';
     }
   }
 
@@ -167,19 +266,21 @@ static void row(uint32_t t_us, uint32_t loop_us, float dt_loop,
     // Always write full schema to SD
     logFile.print(t_us); logFile.print(',');
     logFile.print(loop_us); logFile.print(',');
-    logFile.print(dt_loop, 6); logFile.print(',');
+      logFile.print(dt_loop, 8); logFile.print(',');
     logFile.print(read_idx); logFile.print(',');
     logFile.print(leg_idx); logFile.print(',');
     logFile.print((int)joint_id); logFile.print(',');
-    logFile.print(q_meas, 6); logFile.print(',');
-    logFile.print(dq_meas, 6); logFile.print(',');
+      logFile.print(q_meas, 8); logFile.print(',');
+      logFile.print(dq_meas, 8); logFile.print(',');
+      logFile.print(q_est, 8); logFile.print(',');
+      logFile.print(dq_est, 8); logFile.print(',');
     logFile.print(tempC); logFile.print(',');
     logFile.print(mV); logFile.print(',');
-    logFile.print(q_cmd, 6); logFile.print(',');
-    logFile.print(q_ref, 6); logFile.print(',');
-    logFile.print(e, 6); logFile.print(',');
+      logFile.print(q_cmd, 8); logFile.print(',');
+      logFile.print(q_ref, 8); logFile.print(',');
+      logFile.print(e, 8); logFile.print(',');
     logFile.print(phase_str); logFile.print(',');
-    logFile.print(u, 6); logFile.print('\n');
+      logFile.print(u, 8); logFile.print('\n');
 
     // Periodic flush + rollover + error degrade
     if ((++line_count % FLUSH_EVERY) == 0) {
@@ -241,6 +342,29 @@ static void cat(const char* path, uint32_t max_bytes = 4096) {
   }
   Serial.println();
   f.close();
+}
+
+// ------------------------- Simple config helpers ---------------------
+// Persist and retrieve the 'every' cycles setting via the unified /config.txt.
+// Key: log.every
+// Example lines:
+//   # Hexapod config
+//   home_cdeg=...
+//   log.every=166
+static uint32_t loadEvery(uint32_t defaultVal = 166) {
+  if (!sd_ok) return defaultVal;
+  Config::ensureFile();
+  long v = Config::getInt("log.every", (long)defaultVal);
+  if (v < 1) v = defaultVal;
+  return (uint32_t)v;
+}
+
+static bool saveEvery(uint32_t every) {
+  if (!sd_ok) { Serial.println("[LOG] SD not available; cannot persist 'every'."); return false; }
+  Config::ensureFile();
+  bool ok = Config::setInt("log.every", (long)every);
+  if (!ok) Serial.println("[LOG] Failed to persist log.every to /config.txt");
+  return ok;
 }
 
 // Convenience wrappers preserved for compatibility with your main
