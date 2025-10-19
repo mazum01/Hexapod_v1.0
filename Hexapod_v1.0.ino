@@ -1000,6 +1000,9 @@ void setup() {
 
   // Load safety thresholds from /config.txt (with sane clamps)
   safetyLoadConfig();
+  
+  // Ensure a factory defaults file exists (can be used for resets)
+  Config::ensureFactoryFile();
 
   // Load gait stance height if present
   Config::ensureFile();
@@ -1034,6 +1037,19 @@ void setup() {
       s.servos[idx]  = new LX16AServo(s.legBus[leg], SERVO_ID[leg][dof]);
       s.J[idx].srv   = s.servos[idx];
     }
+  }
+  
+  // Config management commands
+  if (streqi(argv[0], "cfg")) {
+    if (argc >= 2 && streqi(argv[1], "factory")) {
+      if (!Log::sdReady()) { Serial.println("[CFG] SD not available."); return; }
+      if (Config::resetToFactory()) {
+        Serial.println("[CFG] Factory defaults restored. Consider 'R' to reboot and reload settings.");
+      }
+      return;
+    }
+    Serial.println("[CFG] usage: cfg factory");
+    return;
   }
 
   // Home angles

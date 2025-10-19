@@ -108,6 +108,7 @@ Basics
   safety set min_mv <n>        : Set ignore-bogus limit (1000..low_mv-500)
   R | r                        : Software reboot
   gait run | gait stop         : Start/stop tripod gait
+  cfg factory                  : Reset /config.txt to factory defaults (reboot recommended)
   gait show                    : Show gait parameters (stance height)
   gait stance <mm>             : Set base stance height (mm, negative down) and persist
   gait stride <mm>             : Set stride length (mm) and persist
