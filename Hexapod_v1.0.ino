@@ -14,7 +14,7 @@
                                                 → move_time(centideg, ms)
    • Safety: NaN/Inf guards, slew clamps, joint limits, integrator clear on hot/low-V.
    • Global + per-leg enable; serial commands for tuning (VSD, PID, slew), gait, stance, logging.
-  • Tri-state logging: Serial / SD / Both (default SD Only), with `log ls`, `log cat`.
+  • Tri-state logging: Serial / SD / Both / Off (default SD Only), with `log ls`, `log cat`.
   • IK home angles and log settings are persisted in /config.txt on SD; auto-created if missing.
 
    SERIAL COMMANDS (abridged)
@@ -64,33 +64,7 @@
   • 166 Hz loop via IntervalTimer; set tickFlag in ISR; main loop processes on tick.
 */
 
-/*
-   Teensy 4.1 Hexapod Controller (LX16A buses, HTS-35S-style servos)
-   ==================================================================
-
-   BIG PICTURE
-   -----------
-   • 6 legs × 3 DOF LX16A serial-bus servos (centidegrees API).
-  • 166 Hz deterministic loop via IntervalTimer ISR (dt computed once).
-   • Round-robin: read exactly 1 joint/tick; predict others for continuity.
-   • Control stack (per joint):
-       Foot trajectory (mm) → IK → q_des  --->  VSD outer loop (compliant target)
-                                                → PID inner loop (angle, DoM, LPF-D, anti-windup)
-                                                → slew limit & joint limits
-                                                → move_time(centideg, ms)
-   • Safety: NaN/Inf guards, slew clamps, joint limits, integrator clear on hot/low-V.
-   • Global + per-leg enable; serial commands for tuning (VSD, PID, slew), gait, stance, logging.
-   • Tri-state logging: Serial / SD / Both (default Both), with `lo
-   Nova (GPT-5) + Mark M collaboration
-*/
-
-/*
-  (banner comments unchanged)
-*/
-
-/*
-  (your long banner comments are kept as-is)
-*/
+/* (removed duplicate banner; single authoritative banner above) */
 
 #include <Streaming.h>
 #include <string.h>  // for strtok_r
@@ -179,6 +153,19 @@ static void safetyTrip(ControllerState* cs, const char* reason) {
 /*
    CHANGELOG
    ---------
+   2025-10-19
+     - Safety & guards: config-backed thresholds (over_temp_c, low_bus_mv, min_valid_mv) in /config.txt
+       • Sticky trip with console: 'safety show|set|clear'; stops gait + disables joints until re-enabled
+       • Clear PID integrators on warning (hot/low-V) before a trip; status shows last tempC/mV
+       • Print and clear Teensy CrashReport at boot for post-mortem
+     - Gait/IK (WIP): parametric foot trajectory; integrated user 'calculateIK' (centideg) with home offsets and axis mapping
+       • 'gait run|stop' restored; q_des derived from Trajectory → IK → clamps
+       • Actuation guarded: move_time(...) remains commented pending HW validation
+     - Telemetry/timing: enforce 1 read/tick (RR); removed duplicate block; improved dt guards
+     - Logging: schema v1.1; cycle-based 'log every <n>' persisted to /config.txt; supports 'log off' and safe deletions
+     - Home tools: 'home read <leg>' added; homes persisted as 'home_cdeg' with legacy migration
+     - Cleanup/docs: removed unused legIK_3dof; help/status aligned; default boot logging clarified as SD Only
+
    2025-10-17
      - Config: Introduced unified key=value config at /config.txt (see Config.h).
        • Homes now stored as 'home_cdeg' (18 comma-separated centidegree ints).
@@ -228,6 +215,100 @@ static inline float   lpf1(float y_prev, float x, float a){
   if (!isFinite(x))      x      = 0.0f;
   if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
   return (1.0f - a)*y_prev + a*x;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// KINEMATICS AND TRAJECTORY HELPERS
+// ───────────────────────────────────────────────────────────────────────────────
+struct Vector3 { float x, y, z; };
+
+// IK function to calculate servo angles from foot position (adapted from user code)
+// Inputs:
+//  - leg: [0..5]
+//  - x=lateral(mm), y=vertical(mm, up+), z=forward(mm)
+//  - homeAngles: centidegrees array of size N_JOINTS
+// Outputs:
+//  - angles: centidegrees [coxa, femur, tibia], clamped to 0..24000
+// Note: Using primitive params avoids Arduino's auto-prototype issue with custom types.
+static bool calculateIK(int leg, float x, float y, float z, int* angles, const long* homeAngles) {
+  const int LEG_SERVOS = ControllerState::DOF_PER_LEG; // 3
+  const int servoIdxBase = leg * LEG_SERVOS;
+
+  // x: lateral (left +), y: vertical (up +), z: forward (+)
+
+  // Link lengths (mm)
+  const float COXA_LENGTH  = COXA_LENGTH_MM;
+  const float FEMUR_LENGTH = FEMUR_LENGTH_MM;
+  const float TIBIA_LENGTH = TIBIA_LENGTH_MM;
+
+  // Coxa angle (lateral movement, 0° = forward, positive left)
+  float coxaAngleRad = atan2f(x, z);
+  float coxaAngleDeg = rad2deg(coxaAngleRad);
+  // Apply servo home offset; original code subtracts 90° baseline
+  float coxaAngleCentideg = (coxaAngleDeg * 100.0f) + (float)homeAngles[servoIdxBase] - 9000.0f;
+
+  // Distances in sagittal plane
+  float L = sqrtf((x * x) + (z * z)); // horizontal distance hip axis to foot
+  float Dx = (L - COXA_LENGTH);
+  float D  = sqrtf(Dx * Dx + (y * y));
+
+  // Workspace guard
+  if (D > (FEMUR_LENGTH + TIBIA_LENGTH) || D < fabsf(FEMUR_LENGTH - TIBIA_LENGTH)) {
+    // out of reach -> clamp D into workspace but report false
+    float Dmax = FEMUR_LENGTH + TIBIA_LENGTH - 1e-3f;
+    float Dmin = fabsf(FEMUR_LENGTH - TIBIA_LENGTH) + 1e-3f;
+    D = sat(D, Dmin, Dmax);
+    // keep computing but return false after angles are formed
+  }
+
+  // Femur angle
+  float alpha1 = (D > 1e-6f) ? asinf(Dx / D) : 0.0f; // angle of D from horizontal
+  float alpha2 = acosf(sat((D * D + FEMUR_LENGTH * FEMUR_LENGTH - TIBIA_LENGTH * TIBIA_LENGTH) / (2.0f * FEMUR_LENGTH * D), -1.0f, 1.0f));
+  float alpha  = alpha1 + alpha2; // femur relative to horizontal
+  float femurAngleDeg = rad2deg(radians((homeAngles[servoIdxBase + 1] / 100.0f) - 90.0f) + alpha);
+  float femurAngleCentideg = femurAngleDeg * 100.0f;
+
+  // Tibia angle
+  float beta  = acosf(sat((TIBIA_LENGTH * TIBIA_LENGTH + FEMUR_LENGTH * FEMUR_LENGTH - D * D) / (2.0f * FEMUR_LENGTH * TIBIA_LENGTH), -1.0f, 1.0f));
+  float gamma = PI - beta; // complement for servo control
+  float tibiaAngleDeg = rad2deg(radians(homeAngles[servoIdxBase + 2] / 100.0f) + gamma);
+  float tibiaAngleCentideg = tibiaAngleDeg * 100.0f;
+
+  // Clamp to servo range
+  angles[0] = constrain((int)lroundf(coxaAngleCentideg), 0, 24000);
+  angles[1] = constrain((int)lroundf(femurAngleCentideg), 0, 24000);
+  angles[2] = constrain((int)lroundf(tibiaAngleCentideg), 0, 24000);
+
+  // Return false if unreachable but still provide best-effort angles
+  return !( (sqrtf(Dx*Dx + y*y) > (FEMUR_LENGTH + TIBIA_LENGTH)) || (sqrtf(Dx*Dx + y*y) < fabsf(FEMUR_LENGTH - TIBIA_LENGTH)) );
+}
+
+// Parametric foot trajectory along x with lift on swing; y set by leg lateral offset.
+static void footTrajectory_mm(const ControllerState* cs, int leg,
+                              float* x_mm, float* y_mm, float* z_mm) {
+  const auto& lp = cs->L[leg];
+  const float stride = cs->STRIDE_LEN_MM;
+  const float lift   = cs->LIFT_MM;
+  const float z0     = cs->STANCE_HEIGHT_MM; // negative (down)
+  const float y0     = cs->LATERAL_OFFSET_MM[leg];
+
+  float x = 0, z = z0;
+  if (lp.phase == CS_LegPhase::STANCE) {
+    float u = (lp.stance_dur > 1e-6f) ? (lp.phase_t / lp.stance_dur) : 0.0f;
+    u = sat(u, 0.0f, 1.0f);
+    x = (stride * 0.5f) - u * stride;  // +S/2 -> -S/2
+    z = z0;
+  } else {
+    float u = (lp.swing_dur > 1e-6f) ? (lp.phase_t / lp.swing_dur) : 0.0f;
+    u = sat(u, 0.0f, 1.0f);
+    x = (-stride * 0.5f) + u * stride; // -S/2 -> +S/2
+    // Smooth lift arc; zero at ends, peak at mid-swing
+    z = z0 + lift * sinf(PI * u);
+  }
+
+  if (x_mm) *x_mm = x;
+  if (y_mm) *y_mm = y0;
+  if (z_mm) *z_mm = z;
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -598,24 +679,23 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       return;
     }
   }
-  // Temporarily disable gait command to isolate lockup
-  // if (streqi(argv[0], "gait")) {
-  //   if (argc >= 2 && streqi(argv[1], "run")) {
-  //     cs->GAIT_RUN = true;
-  //     Serial.println("[GAIT] RUN");
-  //     return;
-  //   }
-  //   if (argc >= 2 && streqi(argv[1], "stop")) {
-  //     cs->GAIT_RUN = false;
-  //     for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
-  //       cs->L[leg].phase_t = 0.0f;
-  //     }
-  //     Serial.println("[GAIT] STOP");
-  //     return;
-  //   }
-  //   Serial.println("[GAIT] usage: gait run | gait stop");
-  //   return;
-  // }
+  if (streqi(argv[0], "gait")) {
+    if (argc >= 2 && streqi(argv[1], "run")) {
+      cs->GAIT_RUN = true;
+      Serial.println("[GAIT] RUN");
+      return;
+    }
+    if (argc >= 2 && streqi(argv[1], "stop")) {
+      cs->GAIT_RUN = false;
+      for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
+        cs->L[leg].phase_t = 0.0f;
+      }
+      Serial.println("[GAIT] STOP");
+      return;
+    }
+    Serial.println("[GAIT] usage: gait run | gait stop");
+    return;
+  }
 
   if (streqi(argv[0], "home")) {
     // Capture current joint angles as homes (RAM only): home read <leg>
@@ -965,7 +1045,23 @@ void loop() {
   // NOTE: Removed duplicate RR read block; all joint telemetry reads are handled
   // via s.read_joint above to guarantee exactly one read per tick.
 
-  // TODO: trajectory → IK → s.J[j].q_des (kept as-is)
+  // Trajectory → IK → q_des (using provided IK with home offsets)
+  if (s.GAIT_RUN) {
+    for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
+      float xf, yf, zf;
+      footTrajectory_mm(&s, leg, &xf, &yf, &zf); // our frame: x=forward, y=lateral-left, z=up
+      int angles_cdeg[3];
+      // Map to user IK frame: x=lateral, y=vertical, z=forward
+      (void)calculateIK(leg, /*x*/ yf, /*y*/ zf, /*z*/ xf, angles_cdeg, s.home_cdeg);
+      const int j0 = leg * ControllerState::DOF_PER_LEG;
+      float qc = cdeg_to_rad(angles_cdeg[0]);
+      float qf = cdeg_to_rad(angles_cdeg[1]);
+      float qt = cdeg_to_rad(angles_cdeg[2]);
+      s.J[j0 + ControllerState::COXA ].q_des = sat(qc, s.J[j0 + ControllerState::COXA ].qmin, s.J[j0 + ControllerState::COXA ].qmax);
+      s.J[j0 + ControllerState::FEMUR].q_des = sat(qf, s.J[j0 + ControllerState::FEMUR].qmin, s.J[j0 + ControllerState::FEMUR].qmax);
+      s.J[j0 + ControllerState::TIBIA].q_des = sat(qt, s.J[j0 + ControllerState::TIBIA].qmin, s.J[j0 + ControllerState::TIBIA].qmax);
+    }
+  }
 
   // Controllers → command
   for (int j = 0; j < ControllerState::N_JOINTS; ++j) {

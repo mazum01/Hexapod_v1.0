@@ -107,6 +107,7 @@ Basics
   safety set low_mv <n>        : Set low bus voltage (5000..12000 mV)
   safety set min_mv <n>        : Set ignore-bogus limit (1000..low_mv-500)
   R | r                        : Software reboot
+  gait run | gait stop         : Start/stop tripod gait
 
 Stance
   stance                       : Hold all joints at home position (no stepping)
