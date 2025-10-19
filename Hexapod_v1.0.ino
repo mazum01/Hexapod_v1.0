@@ -1055,7 +1055,12 @@ void setup() {
       Config::backupCurrent();
       return;
     }
-    Serial.println("[CFG] usage: cfg factory | cfg backup");
+    if (argc >= 2 && streqi(argv[1], "restore")) {
+      if (!Log::sdReady()) { Serial.println("[CFG] SD not available."); return; }
+      Config::restoreFromBackup();
+      return;
+    }
+    Serial.println("[CFG] usage: cfg factory | cfg backup | cfg restore");
     return;
   }
 

@@ -283,4 +283,12 @@ static bool backupCurrent() {
   return ok;
 }
 
+// Restore /config.txt from BACKUP_PATH. Returns true if copied.
+static bool restoreFromBackup() {
+  if (!SD.exists(BACKUP_PATH)) { Serial.println("[CFG] No /config.backup.txt to restore from."); return false; }
+  bool ok = copyFile(BACKUP_PATH, CONFIG_PATH);
+  Serial.println(ok ? "[CFG] Restored /config.txt from /config.backup.txt" : "[CFG] Restore failed.");
+  return ok;
+}
+
 } // namespace Config
