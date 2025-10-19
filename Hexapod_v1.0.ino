@@ -438,7 +438,7 @@ static size_t cmdLen = 0;
 static void printStartupInfo(ControllerState* cs) {
   Serial << "Hexapod Controller - Teensy 4.1" << endl;
   Serial << "Type 'help' for commands." << endl;
-  Log::begin(); Log::setMode(Log::SD_ONLY); Log::setLevel(Log::DETAIL);
+  Log::begin(); Log::setMode(Log::SD_ONLY); Log::setLevel(Log::loadLevel(Log::DETAIL));
   // Load persisted logging cadence if available
   cs->log_every_cycles = Log::loadEvery(cs->log_every_cycles);
 }
@@ -590,7 +590,8 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       Serial.print("[LOG] mode="); Serial.print(Log::modeName());
       Serial.print("; SD="); Serial.print(Log::sdReady() ? "OK" : "NOT AVAILABLE");
       Serial.print("; file="); Serial.print(Log::currentFile());
-      Serial.print("; every="); Serial.print(cs->log_every_cycles); Serial.println(" cycles");
+      Serial.print("; every="); Serial.print(cs->log_every_cycles);
+      Serial.print(" cycles; level="); Serial.println(Log::levelName());
       return;
     }
     if (streqi(argv[1], "serial")) { Log::setMode(Log::SERIAL_ONLY); return; }
@@ -614,7 +615,17 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       return;
   }
 
-  Serial.println("[LOG] usage: log show|serial|sd|both|off | log ls | log cat <path> | log del <path> | log delall | log every <n>");
+  if (argc >= 3 && streqi(argv[1], "level")) {
+      if (!Log::setLevelByName(argv[2])) {
+        Serial.println("[LOG] usage: log level <0|1|2|basic|detail|debug>");
+        return;
+      }
+      Log::saveLevel(Log::getLevel());
+      Serial.print("[LOG] level set to: "); Serial.println(Log::levelName());
+      return;
+  }
+
+  Serial.println("[LOG] usage: log show|serial|sd|both|off | log ls | log cat <path> | log del <path> | log delall | log every <n> | log level <0|1|2|basic|detail|debug>");
     return;
   }
 
@@ -1111,6 +1122,20 @@ void loop() {
     const int jidx = (int)((s.read_joint == 0) ? ControllerState::N_JOINTS - 1 : s.read_joint - 1);
     const int leg_idx = jidx / ControllerState::DOF_PER_LEG;
     const uint8_t joint_id = (uint8_t)(jidx % ControllerState::DOF_PER_LEG);
+    // Compute foot kinematics for this leg/joint row
+    float fx_mm=0, fy_mm=0, fz_mm=0; int ik_ok=0; float phase_u=0;
+    {
+      float xf, yf, zf;
+      footTrajectory_mm(&s, leg_idx, &xf, &yf, &zf);
+      // Map to user IK frame to match logging axes
+      fx_mm = yf; fy_mm = zf; fz_mm = xf;
+      int tmp[3];
+      ik_ok = calculateIK(leg_idx, /*x*/ yf, /*y*/ zf, /*z*/ xf, tmp, s.home_cdeg) ? 1 : 0;
+      const auto& lp = s.L[leg_idx];
+      const float ph_dur = (lp.phase == CS_LegPhase::STANCE) ? lp.stance_dur : lp.swing_dur;
+      phase_u = (ph_dur > 1e-6f) ? sat(lp.phase_t / ph_dur, 0.0f, 1.0f) : 0.0f;
+    }
+
     Log::row(
       s.loop_stamp_us,
       loop_us,
@@ -1128,7 +1153,8 @@ void loop() {
       s.J[jidx].q_des,
       s.J[jidx].q_des - s.J[jidx].q_meas,
       (s.L[leg_idx].phase == CS_LegPhase::STANCE ? "STANCE" : "SWING"),
-      s.J[jidx].u_out);
+      s.J[jidx].u_out,
+      fx_mm, fy_mm, fz_mm, ik_ok, phase_u);
     s.log_cycle_counter = 0;
   }
 }

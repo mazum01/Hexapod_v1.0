@@ -65,11 +65,12 @@ static void startNewFile() {
     Serial << "[LOG] SD open failed; switching to Serial only." << endl;
     return;
   }
-  // Write versioned header preamble and CSV header (includes estimates)
-  logFile.print("# schema=v1.1, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n");
+  // Write versioned header preamble and CSV header (includes kinematics)
+  logFile.print("# schema=v1.2, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C],foot[mm]\n");
   logFile.print("t_us,loop_us,dt_loop,read_idx,leg,joint_id,"
                 "q_meas_rad,dq_meas_rads,q_est_rad,dq_est_rads,tempC,mV,"
-                "q_cmd_rad,q_ref_rad,e_rad,phase,u\n");
+                "q_cmd_rad,q_ref_rad,e_rad,phase,u,"
+                "fx_mm,fy_mm,fz_mm,ik_ok,phase_u\n");
   logFile.flush();
   line_count = 0;
 }
@@ -122,6 +123,23 @@ static void  setLevel(Level L) { currentLevel = L; }
 
 // Public-facing name (fixes main calling Log::modeName())
 static const char* modeName() { return modeNameStr(); }
+// Human-readable logging level name
+static const char* levelName() {
+  switch (currentLevel) {
+    case BASIC: return "basic";
+    case DETAIL: return "detail";
+    case DEBUG: return "debug";
+    default: return "unknown";
+  }
+}
+// Set level by name or numeric string ("0".."2")
+static bool setLevelByName(const char* name) {
+  if (!name) return false;
+  if (strcasecmp(name, "basic") == 0 || strcmp(name, "0") == 0) { currentLevel = BASIC; return true; }
+  if (strcasecmp(name, "detail") == 0 || strcmp(name, "1") == 0) { currentLevel = DETAIL; return true; }
+  if (strcasecmp(name, "debug") == 0 || strcmp(name, "2") == 0) { currentLevel = DEBUG; return true; }
+  return false;
+}
 // Current log file path (if any); returns "(none)" if not opened yet.
 static const char* currentFile() { return fname[0] ? fname : "(none)"; }
 
@@ -217,10 +235,11 @@ static void header() {
   const char* h =
     "t_us,loop_us,dt_loop,read_idx,leg,joint_id,"
     "q_meas_rad,dq_meas_rads,q_est_rad,dq_est_rads,tempC,mV,"
-    "q_cmd_rad,q_ref_rad,e_rad,phase,u\n";
+    "q_cmd_rad,q_ref_rad,e_rad,phase,u,"
+    "fx_mm,fy_mm,fz_mm,ik_ok,phase_u\n";
 
   if (currentMode == SERIAL_ONLY || currentMode == BOTH) {
-    Serial << "# schema=v1.1, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C]\n";
+    Serial << "# schema=v1.2, units: t_us,loop_us,dt[s],angles[rad],vin[mV],temp[C],foot[mm]\n";
     Serial << h;
   }
 
@@ -236,7 +255,8 @@ static void row(uint32_t t_us, uint32_t loop_us, float dt_loop,
                 float q_meas, float dq_meas, float q_est, float dq_est,
                 int16_t tempC, int16_t mV,
                 float q_cmd, float q_ref, float e,
-                const char* phase_str, float u)
+                const char* phase_str, float u,
+                float fx_mm, float fy_mm, float fz_mm, int ik_ok, float phase_u)
 {
   if (currentMode == NONE) {
     return; // logging fully disabled
@@ -246,14 +266,16 @@ static void row(uint32_t t_us, uint32_t loop_us, float dt_loop,
 
   // Serial path
   if (currentMode == SERIAL_ONLY || currentMode == BOTH) {
-    if (verbose) {
+   if (verbose) {
         Serial << t_us << ',' << loop_us << ',' << _FLOAT(dt_loop, 8) << ','
              << read_idx << ',' << leg_idx << ',' << (int)joint_id << ','
                 << _FLOAT(q_meas, 8) << ',' << _FLOAT(dq_meas, 8) << ','
              << _FLOAT(q_est, 8) << ',' << _FLOAT(dq_est, 8) << ','
              << tempC << ',' << mV << ','
-                << _FLOAT(q_cmd, 8) << ',' << _FLOAT(q_ref, 8) << ',' << _FLOAT(e, 8) << ','
-             << phase_str << ',' << u << '\n';
+           << _FLOAT(q_cmd, 8) << ',' << _FLOAT(q_ref, 8) << ',' << _FLOAT(e, 8) << ','
+         << phase_str << ',' << u << ','
+         << _FLOAT(fx_mm, 3) << ',' << _FLOAT(fy_mm, 3) << ',' << _FLOAT(fz_mm, 3) << ','
+         << ik_ok << ',' << _FLOAT(phase_u, 3) << '\n';
     } else {
       // BASIC: timestamp, leg/joint, q_meas, q_cmd
       Serial << t_us << ',' << leg_idx << ',' << (int)joint_id << ','
@@ -280,7 +302,12 @@ static void row(uint32_t t_us, uint32_t loop_us, float dt_loop,
       logFile.print(q_ref, 8); logFile.print(',');
       logFile.print(e, 8); logFile.print(',');
     logFile.print(phase_str); logFile.print(',');
-      logFile.print(u, 8); logFile.print('\n');
+      logFile.print(u, 8); logFile.print(',');
+      logFile.print(fx_mm, 3); logFile.print(',');
+      logFile.print(fy_mm, 3); logFile.print(',');
+      logFile.print(fz_mm, 3); logFile.print(',');
+    logFile.print(ik_ok); logFile.print(',');
+      logFile.print(phase_u, 3); logFile.print('\n');
 
     // Periodic flush + rollover + error degrade
     if ((++line_count % FLUSH_EVERY) == 0) {
@@ -364,6 +391,24 @@ static bool saveEvery(uint32_t every) {
   Config::ensureFile();
   bool ok = Config::setInt("log.every", (long)every);
   if (!ok) Serial.println("[LOG] Failed to persist log.every to /config.txt");
+  return ok;
+}
+
+// Persist and retrieve the log level (BASIC=0, DETAIL=1, DEBUG=2)
+// Key: log.level
+static Level loadLevel(Level defaultVal = DETAIL) {
+  if (!sd_ok) return defaultVal;
+  Config::ensureFile();
+  long v = Config::getInt("log.level", (long)defaultVal);
+  if (v < 0) v = 0; if (v > 2) v = 2;
+  return (Level)v;
+}
+
+static bool saveLevel(Level level) {
+  if (!sd_ok) { Serial.println("[LOG] SD not available; cannot persist 'level'."); return false; }
+  Config::ensureFile();
+  bool ok = Config::setInt("log.level", (long)level);
+  if (!ok) Serial.println("[LOG] Failed to persist log.level to /config.txt");
   return ok;
 }
 
