@@ -109,6 +109,7 @@ Basics
   R | r                        : Software reboot
   gait run | gait stop         : Start/stop tripod gait
   cfg factory                  : Reset /config.txt to factory defaults (reboot recommended)
+  cfg backup                   : Save a copy of /config.txt to /config.backup.txt
   gait show                    : Show gait parameters (stance height)
   gait stance <mm>             : Set base stance height (mm, negative down) and persist
   gait stride <mm>             : Set stride length (mm) and persist

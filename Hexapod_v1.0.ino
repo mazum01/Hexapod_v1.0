@@ -1043,12 +1043,19 @@ void setup() {
   if (streqi(argv[0], "cfg")) {
     if (argc >= 2 && streqi(argv[1], "factory")) {
       if (!Log::sdReady()) { Serial.println("[CFG] SD not available."); return; }
+      // Attempt a backup first
+      Config::backupCurrent();
       if (Config::resetToFactory()) {
         Serial.println("[CFG] Factory defaults restored. Consider 'R' to reboot and reload settings.");
       }
       return;
     }
-    Serial.println("[CFG] usage: cfg factory");
+    if (argc >= 2 && streqi(argv[1], "backup")) {
+      if (!Log::sdReady()) { Serial.println("[CFG] SD not available."); return; }
+      Config::backupCurrent();
+      return;
+    }
+    Serial.println("[CFG] usage: cfg factory | cfg backup");
     return;
   }
 

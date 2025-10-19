@@ -17,6 +17,7 @@ namespace Config {
 static const char* CONFIG_PATH = "/config.txt";
 static const char* CONFIG_TMP   = "/config.tmp";
 static const char* FACTORY_PATH = "/config.factory.txt";
+static const char* BACKUP_PATH  = "/config.backup.txt";
 
 // Trim helpers (in-place)
 static inline void rtrim(char* s) {
@@ -271,6 +272,14 @@ static bool resetToFactory() {
   if (!factoryExists()) { Serial.println("[CFG] Factory defaults missing."); return false; }
   bool ok = copyFile(FACTORY_PATH, CONFIG_PATH);
   Serial.println(ok ? "[CFG] /config.txt reset to factory defaults." : "[CFG] Reset failed.");
+  return ok;
+}
+
+// Backup current /config.txt to BACKUP_PATH. Returns true if copied.
+static bool backupCurrent() {
+  if (!SD.exists(CONFIG_PATH)) { Serial.println("[CFG] No /config.txt to back up."); return false; }
+  bool ok = copyFile(CONFIG_PATH, BACKUP_PATH);
+  Serial.println(ok ? "[CFG] Backed up /config.txt to /config.backup.txt" : "[CFG] Backup failed.");
   return ok;
 }
 
