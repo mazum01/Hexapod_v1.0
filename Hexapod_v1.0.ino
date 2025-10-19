@@ -161,7 +161,8 @@ static void safetyTrip(ControllerState* cs, const char* reason) {
      - Gait/IK (WIP): parametric foot trajectory; integrated user 'calculateIK' (centideg) with home offsets and axis mapping
        • 'gait run|stop' restored; q_des derived from Trajectory → IK → clamps
        • Actuation guarded: move_time(...) remains commented pending HW validation
-       • Stance height default −120 mm and now configurable via /config.txt (gait.stance_mm) and CLI 'gait stance <mm>'
+  • Stance height default −120 mm and now configurable via /config.txt (gait.stance_mm) and CLI 'gait stance <mm>'
+  • Exposed gait params: stride (gait.stride_mm), lift (gait.lift_mm), and durations (gait.stance_ms, gait.swing_ms) with CLI controls
      - Telemetry/timing: enforce 1 read/tick (RR); removed duplicate block; improved dt guards
      - Logging: schema v1.1; cycle-based 'log every <n>' persisted to /config.txt; supports 'log off' and safe deletions
      - Home tools: 'home read <leg>' added; homes persisted as 'home_cdeg' with legacy migration
@@ -462,7 +463,12 @@ static void printStatus(ControllerState* cs) {
   Serial.print(cs->last_dt_loop, 6); Serial.println(" s");
 
   // Gait params
-  Serial.print("  GAIT params: stance_mm="); Serial.println(cs->STANCE_HEIGHT_MM, 1);
+  Serial.print("  GAIT params: stance_mm="); Serial.print(cs->STANCE_HEIGHT_MM, 1);
+  Serial.print(", stride_mm="); Serial.print(cs->STRIDE_LEN_MM, 1);
+  Serial.print(", lift_mm="); Serial.print(cs->LIFT_MM, 1);
+  Serial.print(", dur_ms=("); Serial.print((int)(cs->STANCE_DUR * 1000));
+  Serial.print(", "); Serial.print((int)(cs->SWING_DUR * 1000));
+  Serial.println(")");
 
   // Logging destination and SD availability
   Serial.print("  LOG: mode="); Serial.print(Log::modeName());
@@ -709,7 +715,11 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       return;
     }
     if (argc >= 2 && streqi(argv[1], "show")) {
-      Serial.print("[GAIT] stance height (mm): "); Serial.println(cs->STANCE_HEIGHT_MM, 1);
+      Serial.print("[GAIT] stance_mm="); Serial.print(cs->STANCE_HEIGHT_MM, 1);
+      Serial.print(" stride_mm="); Serial.print(cs->STRIDE_LEN_MM, 1);
+      Serial.print(" lift_mm="); Serial.print(cs->LIFT_MM, 1);
+      Serial.print(" dur_ms=("); Serial.print((int)(cs->STANCE_DUR * 1000));
+      Serial.print(", "); Serial.print((int)(cs->SWING_DUR * 1000)); Serial.println(")");
       return;
     }
     if (argc >= 3 && streqi(argv[1], "stance")) {
@@ -731,7 +741,51 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       Serial.print("[GAIT] stance height set to "); Serial.print((int)mm); Serial.println(" mm");
       return;
     }
-    Serial.println("[GAIT] usage: gait run | gait stop | gait show | gait stance <mm>");
+    if (argc >= 3 && streqi(argv[1], "stride")) {
+      char* endp = nullptr;
+      long mm = strtol(argv[2], &endp, 10);
+      if (endp == argv[2]) { Serial.println("[GAIT] usage: gait stride <mm>"); return; }
+      if (mm < 10) mm = 10; if (mm > 300) mm = 300; // sane range
+      cs->STRIDE_LEN_MM = (float)mm;
+      Config::ensureFile();
+      if (!Config::setInt("gait.stride_mm", mm)) Serial.println("[GAIT] failed to persist stride");
+      Serial.print("[GAIT] stride set to "); Serial.print((int)mm); Serial.println(" mm");
+      return;
+    }
+    if (argc >= 3 && streqi(argv[1], "lift")) {
+      char* endp = nullptr;
+      long mm = strtol(argv[2], &endp, 10);
+      if (endp == argv[2]) { Serial.println("[GAIT] usage: gait lift <mm>"); return; }
+      if (mm < 5) mm = 5; if (mm > 120) mm = 120; // sane range
+      cs->LIFT_MM = (float)mm;
+      Config::ensureFile();
+      if (!Config::setInt("gait.lift_mm", mm)) Serial.println("[GAIT] failed to persist lift");
+      Serial.print("[GAIT] lift set to "); Serial.print((int)mm); Serial.println(" mm");
+      return;
+    }
+    if (argc >= 4 && streqi(argv[1], "dur")) {
+      char* e1 = nullptr; char* e2 = nullptr;
+      long stance_ms = strtol(argv[2], &e1, 10);
+      long swing_ms  = strtol(argv[3], &e2, 10);
+      if (e1 == argv[2] || e2 == argv[3]) { Serial.println("[GAIT] usage: gait dur <stance_ms> <swing_ms>"); return; }
+      if (stance_ms < 50) stance_ms = 50; if (stance_ms > 2000) stance_ms = 2000;
+      if (swing_ms  < 30) swing_ms  = 30; if (swing_ms  > 2000) swing_ms  = 2000;
+      cs->STANCE_DUR = stance_ms / 1000.0f;
+      cs->SWING_DUR  = swing_ms  / 1000.0f;
+      // Also update each leg's phase durations to reflect new gait timing
+      for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
+        cs->L[leg].stance_dur = cs->STANCE_DUR;
+        cs->L[leg].swing_dur  = cs->SWING_DUR;
+      }
+      Config::ensureFile();
+      bool ok1 = Config::setInt("gait.stance_ms", stance_ms);
+      bool ok2 = Config::setInt("gait.swing_ms", swing_ms);
+      if (!ok1 || !ok2) Serial.println("[GAIT] failed to persist durations");
+      Serial.print("[GAIT] durations set to (stance,swing)= (");
+      Serial.print((int)stance_ms); Serial.print(", "); Serial.print((int)swing_ms); Serial.println(") ms");
+      return;
+    }
+    Serial.println("[GAIT] usage: gait run | gait stop | gait show | gait stance <mm> | gait stride <mm> | gait lift <mm> | gait dur <stance_ms> <swing_ms>");
     return;
   }
 
@@ -952,6 +1006,20 @@ void setup() {
   long stance_mm = Config::getInt("gait.stance_mm", (long)s.STANCE_HEIGHT_MM);
   if (stance_mm < -250) stance_mm = -250; if (stance_mm > 0) stance_mm = 0;
   s.STANCE_HEIGHT_MM = (float)stance_mm;
+  // Load gait stride/lift/durations with clamps
+  long stride_mm = Config::getInt("gait.stride_mm", (long)s.STRIDE_LEN_MM);
+  if (stride_mm < 10) stride_mm = 10; if (stride_mm > 300) stride_mm = 300;
+  s.STRIDE_LEN_MM = (float)stride_mm;
+  long lift_mm = Config::getInt("gait.lift_mm", (long)s.LIFT_MM);
+  if (lift_mm < 5) lift_mm = 5; if (lift_mm > 120) lift_mm = 120;
+  s.LIFT_MM = (float)lift_mm;
+  long stance_ms = Config::getInt("gait.stance_ms", (long)(s.STANCE_DUR * 1000));
+  long swing_ms  = Config::getInt("gait.swing_ms",  (long)(s.SWING_DUR  * 1000));
+  if (stance_ms < 50) stance_ms = 50; if (stance_ms > 2000) stance_ms = 2000;
+  if (swing_ms  < 30) swing_ms  = 30; if (swing_ms  > 2000) swing_ms  = 2000;
+  s.STANCE_DUR = stance_ms / 1000.0f;
+  s.SWING_DUR  = swing_ms  / 1000.0f;
+  for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) { s.L[leg].stance_dur = s.STANCE_DUR; s.L[leg].swing_dur = s.SWING_DUR; }
 
   // Per-leg serial buses; enable 74HC126 buffers
   for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {

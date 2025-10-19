@@ -110,6 +110,10 @@ Basics
   gait run | gait stop         : Start/stop tripod gait
   gait show                    : Show gait parameters (stance height)
   gait stance <mm>             : Set base stance height (mm, negative down) and persist
+  gait stride <mm>             : Set stride length (mm) and persist
+  gait lift <mm>               : Set swing lift height (mm) and persist
+  gait dur <stance_ms> <swing_ms>
+                               : Set stance/swing durations (milliseconds) and persist
 
 Stance
   stance                       : Hold all joints at home position (no stepping)
