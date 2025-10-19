@@ -979,7 +979,8 @@ void loop() {
   s.tickFlag = false;
 
   const uint32_t now_us = micros();
-  float dt_loop = (float)((uint32_t)(now_us - s.loop_stamp_us)) * 1e-6f;
+  const uint32_t loop_us = (uint32_t)(now_us - s.loop_stamp_us);
+  float dt_loop = (float)loop_us * 1e-6f;
   if (!(dt_loop > 0.0f) || !isFinite(dt_loop) || dt_loop > 0.2f) dt_loop = s.Ts;  // guard bad/slow ticks
   s.loop_stamp_us = now_us;
   s.last_dt_loop = dt_loop;
@@ -1074,14 +1075,16 @@ void loop() {
 
     float derr = (X.q_meas - X.pid.x_prev) / dt_loop;
     X.pid.x_prev = X.q_meas;
-    float u = X.pid.kp * err + X.pid.ki * X.pid.i_state - X.pid.kd * derr + tau;
+  float u = X.pid.kp * err + X.pid.ki * X.pid.i_state - X.pid.kd * derr + tau;
 
     float i_next = X.pid.i_state + err * dt_loop;
     const float ICLAMP = 0.5f;
     X.pid.i_state = sat(i_next, -ICLAMP, ICLAMP);
 
-    float q_cmd = sat(X.q_meas + sat(u, -X.dqmax * dt_loop, X.dqmax * dt_loop), X.qmin, X.qmax);
-    const int32_t cdeg = rad_to_cdeg(q_cmd);
+  float q_cmd = sat(X.q_meas + sat(u, -X.dqmax * dt_loop, X.dqmax * dt_loop), X.qmin, X.qmax);
+  const int32_t cdeg = rad_to_cdeg(q_cmd);
+  X.q_cmd = q_cmd;
+  X.u_out = u;
 
     // NOTE: still commented per your code
     // X.srv->move_time(cdeg, (int)(s.Ts * 1000));
@@ -1110,7 +1113,7 @@ void loop() {
     const uint8_t joint_id = (uint8_t)(jidx % ControllerState::DOF_PER_LEG);
     Log::row(
       s.loop_stamp_us,
-      (uint32_t)(dt_loop * 1e6f),
+      loop_us,
       dt_loop,
       jidx,
       leg_idx,
@@ -1121,9 +1124,11 @@ void loop() {
       s.J[jidx].dq_est,
       (int16_t)s.J[jidx].temp,
       (int16_t)s.J[jidx].vin,
-      0, 0, 0,
+      s.J[jidx].q_cmd,
+      s.J[jidx].q_des,
+      s.J[jidx].q_des - s.J[jidx].q_meas,
       (s.L[leg_idx].phase == CS_LegPhase::STANCE ? "STANCE" : "SWING"),
-      0);
+      s.J[jidx].u_out);
     s.log_cycle_counter = 0;
   }
 }

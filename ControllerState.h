@@ -13,6 +13,8 @@ struct CS_Joint {
   bool has_meas = false;
   float q_des = 0, q_meas = 0, dq_meas = 0, q_prev = 0, dq_est = 0, q_est = 0;
   float qmin = 0, qmax = 0, dqmax = 0, vin = 0, temp = 0;
+  float q_cmd = 0;   // last commanded position (rad)
+  float u_out = 0;   // last control effort (arbitrary units)
   CS_PID pid{};
   CS_VSD vsd{};
 };
