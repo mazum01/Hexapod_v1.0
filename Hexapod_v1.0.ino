@@ -49,7 +49,7 @@
 
    TUNING BLOCK (starter values)
    -----------------------------
-   • Foot path: STANCE_HEIGHT = -80 mm, STRIDE_LEN = 80 mm, LIFT = 20 mm
+  • Foot path: STANCE_HEIGHT = -120 mm (configurable), STRIDE_LEN = 80 mm, LIFT = 20 mm
    • VSD (base): stance/swing per-DOF (see DEFAULT_VSD_*). These set compliance feel.
    • PID per-DOF defaults: COXA(24,32,0.5), FEMUR(28,36,0.6), TIBIA(22,32,0.5)
    • Slew default: 300 deg/s per-DOF (converted to rad/s internally)
@@ -161,6 +161,7 @@ static void safetyTrip(ControllerState* cs, const char* reason) {
      - Gait/IK (WIP): parametric foot trajectory; integrated user 'calculateIK' (centideg) with home offsets and axis mapping
        • 'gait run|stop' restored; q_des derived from Trajectory → IK → clamps
        • Actuation guarded: move_time(...) remains commented pending HW validation
+       • Stance height default −120 mm and now configurable via /config.txt (gait.stance_mm) and CLI 'gait stance <mm>'
      - Telemetry/timing: enforce 1 read/tick (RR); removed duplicate block; improved dt guards
      - Logging: schema v1.1; cycle-based 'log every <n>' persisted to /config.txt; supports 'log off' and safe deletions
      - Home tools: 'home read <leg>' added; homes persisted as 'home_cdeg' with legacy migration
@@ -460,6 +461,9 @@ static void printStatus(ControllerState* cs) {
   Serial.print(" (Ts="); Serial.print(cs->Ts, 6); Serial.print(" s)  dt(last)=");
   Serial.print(cs->last_dt_loop, 6); Serial.println(" s");
 
+  // Gait params
+  Serial.print("  GAIT params: stance_mm="); Serial.println(cs->STANCE_HEIGHT_MM, 1);
+
   // Logging destination and SD availability
   Serial.print("  LOG: mode="); Serial.print(Log::modeName());
   Serial.print("; SD="); Serial.println(Log::sdReady() ? "OK" : "NOT AVAILABLE");
@@ -704,7 +708,30 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       Serial.println("[GAIT] STOP");
       return;
     }
-    Serial.println("[GAIT] usage: gait run | gait stop");
+    if (argc >= 2 && streqi(argv[1], "show")) {
+      Serial.print("[GAIT] stance height (mm): "); Serial.println(cs->STANCE_HEIGHT_MM, 1);
+      return;
+    }
+    if (argc >= 3 && streqi(argv[1], "stance")) {
+      char* endp = nullptr;
+      long mm = strtol(argv[2], &endp, 10);
+      if (endp == argv[2]) { Serial.println("[GAIT] usage: gait stance <mm> (negative down)"); return; }
+      if (mm > 0) {
+        Serial.println("[GAIT] warning: positive is up; typical values are negative (down)");
+      }
+      // Clamp to a sane range (-250..0 mm)
+      if (mm < -250) mm = -250;
+      if (mm > 0) mm = 0;
+      cs->STANCE_HEIGHT_MM = (float)mm;
+      // Persist to config
+      Config::ensureFile();
+      if (!Config::setInt("gait.stance_mm", mm)) {
+        Serial.println("[GAIT] failed to persist stance to /config.txt");
+      }
+      Serial.print("[GAIT] stance height set to "); Serial.print((int)mm); Serial.println(" mm");
+      return;
+    }
+    Serial.println("[GAIT] usage: gait run | gait stop | gait show | gait stance <mm>");
     return;
   }
 
@@ -919,6 +946,12 @@ void setup() {
 
   // Load safety thresholds from /config.txt (with sane clamps)
   safetyLoadConfig();
+
+  // Load gait stance height if present
+  Config::ensureFile();
+  long stance_mm = Config::getInt("gait.stance_mm", (long)s.STANCE_HEIGHT_MM);
+  if (stance_mm < -250) stance_mm = -250; if (stance_mm > 0) stance_mm = 0;
+  s.STANCE_HEIGHT_MM = (float)stance_mm;
 
   // Per-leg serial buses; enable 74HC126 buffers
   for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {

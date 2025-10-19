@@ -108,6 +108,8 @@ Basics
   safety set min_mv <n>        : Set ignore-bogus limit (1000..low_mv-500)
   R | r                        : Software reboot
   gait run | gait stop         : Start/stop tripod gait
+  gait show                    : Show gait parameters (stance height)
+  gait stance <mm>             : Set base stance height (mm, negative down) and persist
 
 Stance
   stance                       : Hold all joints at home position (no stepping)

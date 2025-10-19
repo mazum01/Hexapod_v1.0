@@ -71,7 +71,7 @@ public:
   CS_VSD VSD_OVERRIDE   [DOF_PER_LEG]{};
 
   // Trajectory / geometry knobs
-  float STANCE_HEIGHT_MM = -80.0f;
+  float STANCE_HEIGHT_MM = -120.0f;
   float STRIDE_LEN_MM    =  80.0f;
   float LIFT_MM          =  20.0f;
   float LATERAL_OFFSET_MM[N_LEGS] = {-25,-25,-25, 25,25,25};
