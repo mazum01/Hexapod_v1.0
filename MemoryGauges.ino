@@ -63,14 +63,18 @@ void stackCanaryInit() {
   }
 
   __canary_start = base;
-  __canary_end   = end;
+  // Paint only a limited portion to avoid long blocking or touching reserved areas.
+  const size_t PAINT_LIMIT = 16 * 1024; // 16 KB max to paint for safety
+  size_t paint_bytes = window;
+  if (paint_bytes > PAINT_LIMIT) paint_bytes = PAINT_LIMIT;
+  __canary_end = (uint32_t*)((uint8_t*)__canary_start + paint_bytes);
 
   for (uint32_t* p = __canary_start; p < __canary_end; ++p) {
     *p = 0xDEADBEEF;
   }
 
   __canary_ok            = true;
-  __canary_painted_bytes = (uint32_t)window;
+  __canary_painted_bytes = (uint32_t)paint_bytes;
 }
 
 static uint32_t stackFreeNow_impl() {
