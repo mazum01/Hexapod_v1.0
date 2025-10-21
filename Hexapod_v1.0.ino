@@ -79,6 +79,11 @@
 #include <EEPROM.h>
 #include "MemoryGauges.h"
 
+// Disable boot-time memory prints by default to keep startup minimal for USB enum.
+#ifndef MEM_GAUGES_BOOT_PRINTS
+#define MEM_GAUGES_BOOT_PRINTS 0
+#endif
+
 // IntelliSense-only fallback for strtok_r to silence parser squiggles.
 // Teensy/newlib provides strtok_r at build time; this shim is ignored by the compiler.
 #ifdef __INTELLISENSE__
@@ -989,9 +994,10 @@ void setup() {
   // }
   
   stackCanaryInit();
+#if MEM_GAUGES_BOOT_PRINTS
   Serial.printf("[MEM] canary window = %u bytes\n", mem_canary_window());
   Serial.printf("[MEM] heap_top=%p sp_init=%p freeGap=%u\n", (void*)mem_heap_top_addr(), (void*)mem_sp_init_addr(), mem_freeHeapGap());
-  Serial.printf("[MEM] freeGap=%u maxAlloc=%u\n", mem_freeHeapGap(), mem_maxHeapAllocTest());
+#endif
 
   // s.initDefaults();
   // printStartupInfo(&s);
