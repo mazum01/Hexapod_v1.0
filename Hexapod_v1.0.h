@@ -15,8 +15,11 @@
 // =====================================================================
 
 #define FW_NAME     "Hexapod Controller"
-#define FW_VERSION  "1.8.0"   // IK + VSD/PID + SD-persisted IK homes + String console + tri-logging
+#define FW_VERSION  "1.9.0"
 #define FW_BUILD_DT __DATE__ " " __TIME__
+
+
+// (Safe Mode removed)
 
 // =====================================================================
 //                  ROBOT TOPOLOGY / CONSTANTS (LEAVE EARLY)
@@ -62,17 +65,17 @@ uint8_t SERVO_ID[N_LEGS][DOF_PER_LEG] = {
 const int bufferEnablePins[N_LEGS] = {32, 9, 6, 22, 16, 36};
 
 // LX-16A servo bus objects
-LX16ABus* legBus[N_LEGS];
+LX16ABus legBus[N_LEGS];
 
 // Array of LX16AServo objects for each servo
-LX16AServo* servos[N_JOINTS]; // Pointers to servo objects
+LX16AServo servos[N_JOINTS]; // Pointers to servo objects
 
 namespace Hexapod {
 
 // -----------------------------------------------------------------------------
 // Splash banner (moved from .ino)
 // -----------------------------------------------------------------------------
-inline const char SPLASH_BANNER[] =
+inline const char SPLASH_BANNER[] = "";/*
 R"(+----------------------------------+
 |  __  __    _    ____  ____       |
 | |  \/  |  / \  |  _ \/ ___|      |
@@ -81,7 +84,7 @@ R"(+----------------------------------+
 | |_|  |_/_/   \_\_| \_\____/      |
 |                                  |
 +----------------------------------+
-)";
+)";*/
 
 inline void printSplash(Stream& out = Serial) {
   out.print(SPLASH_BANNER);
@@ -90,7 +93,7 @@ inline void printSplash(Stream& out = Serial) {
 // -----------------------------------------------------------------------------
 // Help text (generated from commands implemented in handleCommandLine())
 // -----------------------------------------------------------------------------
-inline const char HELP_TEXT[] = 
+inline const char HELP_TEXT[] = ""; /*
 R"(================================================================
 Hexapod Console — Help
 ================================================================
@@ -101,12 +104,12 @@ Basics
   e / d                        : Enable/disable ALL servos
   le <leg>                     : Enable one leg (leaves others unchanged) and torque-on
   ld <leg>                     : Disable one leg and torque-off
+  R | r                        : Software reboot
   safety clear                 : Clear safety latch (after over-temp/low-V)
   safety show                  : Show thresholds and last readings
   safety set over_temp_c <n>   : Set trip temp (40..100 C)
   safety set low_mv <n>        : Set low bus voltage (5000..12000 mV)
   safety set min_mv <n>        : Set ignore-bogus limit (1000..low_mv-500)
-  R | r                        : Software reboot
   gait run | gait stop         : Start/stop tripod gait
   cfg factory                  : Reset /config.txt to factory defaults (reboot recommended)
   cfg backup                   : Save a copy of /config.txt to /config.backup.txt
@@ -148,11 +151,12 @@ Notes
   * Deterministic 166 Hz loop; one joint read per tick (others predicted).
   * Tri-state logging respects SD availability; 'log sd' may fall back.
   * Use 'stance' for stable tuning without gait motion.
+  *
   * Safety: If over-temp (>=70C) or low bus voltage (<=7.0V) is detected, the
     controller clears integrators, stops gait, and disables all joints. Use
     'safety clear' to clear the latch, then re-enable with 'e' or 'le <leg>'.
 ================================================================
-)";
+)";*/
 
 // -----------------------------------------------------------------------------
 // Version + helpers

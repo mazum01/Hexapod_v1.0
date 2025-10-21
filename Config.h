@@ -14,10 +14,10 @@
 
 namespace Config {
 
-static const char* CONFIG_PATH = "/config.txt";
-static const char* CONFIG_TMP   = "/config.tmp";
-static const char* FACTORY_PATH = "/config.factory.txt";
-static const char* BACKUP_PATH  = "/config.backup.txt";
+static const char* CONFIG_PATH = R"(/config.txt)";
+static const char* CONFIG_TMP   = R"(/config.tmp)";
+static const char* FACTORY_PATH = R"(/config.factory.txt)";
+static const char* BACKUP_PATH  = R"(/config.backup.txt)";
 
 // Trim helpers (in-place)
 static inline void rtrim(char* s) {
@@ -57,7 +57,7 @@ static bool getString(const char* key, char* outBuf, size_t outSz) {
   if (!f) return false;
 
   const size_t BUFSZ = 256;
-  char line[BUFSZ];
+  static char line[BUFSZ];
   bool found = false;
   while (true) {
     int len = readLine(f, line, sizeof(line));
@@ -130,7 +130,7 @@ static bool setString(const char* key, const char* value) {
   File out = SD.open(CONFIG_TMP, FILE_WRITE);
   if (!out) {
     if (in) in.close();
-    Serial.println("[CFG] Failed to open temp file for write.");
+    Serial.println(R"([CFG] Failed to open temp file for write.)");
     return false;
   }
 
@@ -174,11 +174,11 @@ static bool setString(const char* key, const char* value) {
     if (tmp) tmp.close();
     if (fin) fin.close();
     SD.remove(CONFIG_TMP);
-    Serial.println("[CFG] Failed to finalize config write.");
+    Serial.println(R"([CFG] Failed to finalize config write.)");
     return false;
   }
   const size_t COPYBUF = 128;
-  uint8_t buf[COPYBUF];
+  static uint8_t buf[COPYBUF];
   while (true) {
     int n = tmp.read(buf, COPYBUF);
     if (n <= 0) break;
@@ -215,10 +215,10 @@ static bool factoryExists() { return SD.exists(FACTORY_PATH); }
 static void ensureFile() {
   if (exists()) return;
   File f = SD.open(CONFIG_PATH, FILE_WRITE);
-  if (!f) { Serial.println("[CFG] Cannot create /config.txt"); return; }
+  if (!f) { Serial.println(R"([CFG] Cannot create /config.txt)"); return; }
   f.println("# Hexapod config (key=value)\n# home_cdeg=18 comma-separated centidegree ints\n# log.every=166");
   f.close();
-  Serial.println("[CFG] Created /config.txt");
+  Serial.println(R"([CFG] Created /config.txt)");
 }
 
 // Ensure a factory defaults file exists with sane defaults, including original home angles.
@@ -226,7 +226,7 @@ static void ensureFile() {
 static void ensureFactoryFile() {
   if (factoryExists()) return;
   File f = SD.open(FACTORY_PATH, FILE_WRITE);
-  if (!f) { Serial.println("[CFG] Cannot create /config.factory.txt"); return; }
+  if (!f) { Serial.println(R"([CFG] Cannot create /config.factory.txt)"); return; }
   f.println("# Hexapod factory defaults — do not edit on robot if you want to keep a clean baseline");
   f.println("# Copy this over /config.txt to reset settings (see 'cfg factory')\n");
   // Original hard-coded home angles (centideg) from legacy codebase
@@ -245,22 +245,22 @@ static void ensureFactoryFile() {
   f.println("gait.stance_ms=300");
   f.println("gait.swing_ms=150");
   f.close();
-  Serial.println("[CFG] Created /config.factory.txt");
+  Serial.println(R"([CFG] Created /config.factory.txt)");
 }
 
 // Copy a file on SD from src to dst, overwriting dst. Returns true on success.
 static bool copyFile(const char* src, const char* dst) {
   if (!src || !dst) return false;
   File in = SD.open(src, FILE_READ);
-  if (!in) { Serial.print("[CFG] copy: cannot open src: "); Serial.println(src); return false; }
+  if (!in) { Serial.print(R"([CFG] copy: cannot open src: )"); Serial.println(src); return false; }
   SD.remove(dst);
   File out = SD.open(dst, FILE_WRITE);
-  if (!out) { Serial.print("[CFG] copy: cannot open dst: "); Serial.println(dst); in.close(); return false; }
-  uint8_t buf[256];
+  if (!out) { Serial.print(R"([CFG] copy: cannot open dst: )"); Serial.println(dst); in.close(); return false; }
+  static uint8_t buf[256];
   while (true) {
     int n = in.read(buf, sizeof(buf));
     if (n <= 0) break;
-    if (out.write(buf, n) != n) { Serial.println("[CFG] copy: write error"); in.close(); out.close(); return false; }
+  if (out.write(buf, n) != n) { Serial.println(R"([CFG] copy: write error)"); in.close(); out.close(); return false; }
   }
   out.flush(); out.close(); in.close();
   return true;
@@ -269,25 +269,25 @@ static bool copyFile(const char* src, const char* dst) {
 // Reset /config.txt to factory defaults by copying FACTORY_PATH over CONFIG_PATH
 static bool resetToFactory() {
   ensureFactoryFile();
-  if (!factoryExists()) { Serial.println("[CFG] Factory defaults missing."); return false; }
+  if (!factoryExists()) { Serial.println(R"([CFG] Factory defaults missing.)"); return false; }
   bool ok = copyFile(FACTORY_PATH, CONFIG_PATH);
-  Serial.println(ok ? "[CFG] /config.txt reset to factory defaults." : "[CFG] Reset failed.");
+  Serial.println(ok ? R"([CFG] /config.txt reset to factory defaults.)" : R"([CFG] Reset failed.)");
   return ok;
 }
 
 // Backup current /config.txt to BACKUP_PATH. Returns true if copied.
 static bool backupCurrent() {
-  if (!SD.exists(CONFIG_PATH)) { Serial.println("[CFG] No /config.txt to back up."); return false; }
+  if (!SD.exists(CONFIG_PATH)) { Serial.println(R"([CFG] No /config.txt to back up.)"); return false; }
   bool ok = copyFile(CONFIG_PATH, BACKUP_PATH);
-  Serial.println(ok ? "[CFG] Backed up /config.txt to /config.backup.txt" : "[CFG] Backup failed.");
+  Serial.println(ok ? R"([CFG] Backed up /config.txt to /config.backup.txt)" : R"([CFG] Backup failed.)");
   return ok;
 }
 
 // Restore /config.txt from BACKUP_PATH. Returns true if copied.
 static bool restoreFromBackup() {
-  if (!SD.exists(BACKUP_PATH)) { Serial.println("[CFG] No /config.backup.txt to restore from."); return false; }
+  if (!SD.exists(BACKUP_PATH)) { Serial.println(R"([CFG] No /config.backup.txt to restore from.)"); return false; }
   bool ok = copyFile(BACKUP_PATH, CONFIG_PATH);
-  Serial.println(ok ? "[CFG] Restored /config.txt from /config.backup.txt" : "[CFG] Restore failed.");
+  Serial.println(ok ? R"([CFG] Restored /config.txt from /config.backup.txt)" : R"([CFG] Restore failed.)");
   return ok;
 }
 

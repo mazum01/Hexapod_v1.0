@@ -21,11 +21,22 @@ All notable changes to this project will be documented in this file. This mirror
 - Home tools and config
   - Homes are persisted as `home_cdeg` (18 centidegree ints) in `/config.txt`, with migration from legacy `/home_angles.csv`.
   - Added `home read <leg>` to capture current angles into RAM homes (leg must be disabled); `home move` documented and clamped.
+  - Config lifecycle: Ensure factory defaults file at boot; added `cfg factory` (auto-backup then reset), `cfg backup`, and `cfg restore` commands.
 - Cleanup and docs
-  - Removed unused legacy `legIK_3dof` and synchronized help text with implemented commands.
+  - Removed unused legacy `legIK_3dof`; synchronized help text with implemented commands.
+  - Console parser refactor: renamed local argv/argc to tokens/ntokens for clarity and to appease IntelliSense.
   - Default logging mode clarified as SD Only at boot; help/status reflect SD availability.
 - Version
-  - Firmware version stamped as v1.8.0.
+  - Firmware version stamped as v1.9.0.
+
+### Boot stability and Safe Mode
+- Added Safe Mode via pin 33 (INPUT_PULLUP). Hold low at boot to skip SD/ticker/logging for recovery.
+- Implemented EEPROM-backed boot markers and a software watchdog:
+  - Marks boot "in-progress" early in setup and clears on successful completion.
+  - If a reboot occurs without clearing, next boot forces Safe Mode with a notice.
+  - A simple software watchdog pets on healthy loop progress; on timeout, it sets a force-safe flag in EEPROM and reboots.
+  - If a Teensy CrashReport is present, it’s printed, the force-safe flag is set, and the device reboots into Safe Mode for investigation.
+  - Help text updated; status and boot logs reflect Safe Mode reasons.
 
 ## 2025-10-17
 

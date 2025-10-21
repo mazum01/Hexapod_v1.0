@@ -167,8 +167,8 @@ static void normalizePath(const char* in, char* out, size_t outsz) {
 
 // Delete a single log file; returns true if removed.
 static bool del(const char* path) {
-  if (!sd_ok) { Serial.println("[LOG] SD not available."); return false; }
-  if (!path || !*path) { Serial.println("[LOG] del: missing path"); return false; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available.)"); return false; }
+  if (!path || !*path) { Serial.println(R"([LOG] del: missing path)"); return false; }
 
   char pbuf[32]; normalizePath(path, pbuf, sizeof(pbuf));
 
@@ -176,7 +176,7 @@ static bool del(const char* path) {
   const char* name = pbuf;
   if (pbuf[0] == '/') name = pbuf + 1;
 
-  if (!isLogName(name)) { Serial.println("[LOG] del: only LOG*.CSV may be deleted"); return false; }
+  if (!isLogName(name)) { Serial.println(R"([LOG] del: only LOG*.CSV may be deleted)"); return false; }
 
   // Do not delete the current file in use
   if (fname[0] && strcasecmp(pbuf, fname) == 0) {
@@ -194,9 +194,9 @@ static bool del(const char* path) {
 // Delete all LOG*.CSV files in root, excluding current file if excludeCurrent=true.
 // Returns the count of files successfully deleted.
 static int delAll(bool excludeCurrent = true) {
-  if (!sd_ok) { Serial.println("[LOG] SD not available."); return 0; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available.)"); return 0; }
   File root = SD.open("/");
-  if (!root || !root.isDirectory()) { Serial.println("[LOG] Cannot open root directory."); return 0; }
+  if (!root || !root.isDirectory()) { Serial.println(R"([LOG] Cannot open root directory.)"); return 0; }
 
   int count = 0;
   File entry;
@@ -219,13 +219,13 @@ static int delAll(bool excludeCurrent = true) {
     }
   }
   root.close();
-  Serial.print("[LOG] delall: deleted "); Serial.print(count); Serial.println(" file(s)");
+  Serial.print(R"([LOG] delall: deleted )"); Serial.print(count); Serial.println(R"( file(s))");
   return count;
 }
 
 // Manual rotate (close current and open next)
 static void rotate() {
-  if (!sd_ok) { Serial.println("[LOG] SD not available; cannot rotate."); return; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available; cannot rotate.)"); return; }
   startNewFile();
   if (sd_ok) Serial << "[LOG] Rotated to " << fname << endl;
 }
@@ -326,12 +326,12 @@ static void row(uint32_t t_us, uint32_t loop_us, float dt_loop,
 
 // ------------------------- SD browsing utils ------------------------
 static void list(const char* path = "/") {
-  if (!sd_ok) { Serial.println("[LOG] SD not available. (Tip: run 'log show')"); return; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available. (Tip: run 'log show'))"); return; }
   File dir = SD.open(path);
   if (!dir) { Serial.print("[LOG] Cannot open path: "); Serial.println(path); return; }
   if (!dir.isDirectory()) { Serial.print("[LOG] Not a directory: "); Serial.println(path); dir.close(); return; }
 
-  Serial.print("[LOG] Listing '"); Serial.print(path); Serial.println("':");
+  Serial.print(R"([LOG] Listing ')"); Serial.print(path); Serial.println(R"(':")");
   dir.rewindDirectory();
   while (true) {
     File entry = dir.openNextFile();
@@ -346,19 +346,19 @@ static void list(const char* path = "/") {
 }
 
 static void cat(const char* path, uint32_t max_bytes = 4096) {
-  if (!sd_ok) { Serial.println("[LOG] SD not available. (Tip: run 'log show')"); return; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available. (Tip: run 'log show'))"); return; }
   File f = SD.open(path, FILE_READ);
-  if (!f) { Serial.print("[LOG] Cannot open file: "); Serial.println(path); return; }
-  if (f.isDirectory()) { Serial.print("[LOG] Path is a directory, not a file: "); Serial.println(path); f.close(); return; }
+  if (!f) { Serial.print(R"([LOG] Cannot open file: )"); Serial.println(path); return; }
+  if (f.isDirectory()) { Serial.print(R"([LOG] Path is a directory, not a file: )"); Serial.println(path); f.close(); return; }
 
   const uint32_t fsize = f.size();
   uint32_t to_read = (max_bytes == 0) ? fsize : min(max_bytes, fsize);
 
-  Serial.print("[LOG] cat '"); Serial.print(path); Serial.print("' (");
-  Serial.print(to_read); Serial.print(" of "); Serial.print(fsize); Serial.println(" bytes):");
+  Serial.print(R"([LOG] cat ')"); Serial.print(path); Serial.print(R"(' ()");
+  Serial.print(to_read); Serial.print(R"( of )"); Serial.print(fsize); Serial.println(R"( bytes):)" );
 
   static const size_t BUFSZ = 256;
-  uint8_t buf[BUFSZ];
+  static uint8_t buf[BUFSZ];
   while (to_read > 0) {
     size_t chunk = (to_read < BUFSZ) ? to_read : BUFSZ;
     int n = f.read(buf, chunk);
@@ -387,10 +387,10 @@ static uint32_t loadEvery(uint32_t defaultVal = 166) {
 }
 
 static bool saveEvery(uint32_t every) {
-  if (!sd_ok) { Serial.println("[LOG] SD not available; cannot persist 'every'."); return false; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available; cannot persist 'every'.)" ); return false; }
   Config::ensureFile();
   bool ok = Config::setInt("log.every", (long)every);
-  if (!ok) Serial.println("[LOG] Failed to persist log.every to /config.txt");
+  if (!ok) Serial.println(R"([LOG] Failed to persist log.every to /config.txt)" );
   return ok;
 }
 
@@ -405,19 +405,19 @@ static Level loadLevel(Level defaultVal = DETAIL) {
 }
 
 static bool saveLevel(Level level) {
-  if (!sd_ok) { Serial.println("[LOG] SD not available; cannot persist 'level'."); return false; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available; cannot persist 'level'.)"); return false; }
   Config::ensureFile();
   bool ok = Config::setInt("log.level", (long)level);
-  if (!ok) Serial.println("[LOG] Failed to persist log.level to /config.txt");
+  if (!ok) Serial << R"([LOG] Failed to persist log.level to /config.txt)";
   return ok;
 }
 
 // Convenience wrappers preserved for compatibility with your main
 static bool listLogs() {
-  if (!sd_ok) { Serial.println("[LOG] SD not available."); return false; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available.)"); return false; }
   File root = SD.open("/");
-  if (!root) { Serial.println("[LOG] Failed to open root."); return false; }
-  Serial.println("[LOG] Files on SD (LOG*.CSV):");
+  if (!root) { Serial.println(R"([LOG] Failed to open root.)"); return false; }
+  Serial.println(R"([LOG] Files on SD (LOG*.CSV):)");
   File entry;
   root.rewindDirectory();
   while ((entry = root.openNextFile())) {
@@ -425,7 +425,7 @@ static bool listLogs() {
       const char* name = entry.name();
       if (strlen(name) == 11 && strncmp(name, "LOG", 3) == 0 && strcasecmp(name + 7, ".CSV") == 0) {
         Serial.print("  "); Serial.print(name); Serial.print("  ");
-        Serial.print((uint32_t)entry.size()); Serial.println(" bytes");
+  Serial.print((uint32_t)entry.size()); Serial.println(R"( bytes)");
       }
     }
     entry.close();
@@ -435,16 +435,16 @@ static bool listLogs() {
 }
 
 static bool printLog(const char* path, uint32_t max_bytes = 0) {
-  if (!sd_ok) { Serial.println("[LOG] SD not available."); return false; }
+  if (!sd_ok) { Serial.println(R"([LOG] SD not available.)"); return false; }
   File f = SD.open(path, FILE_READ);
-  if (!f) { Serial.print("[LOG] Cannot open "); Serial.println(path); return false; }
+  if (!f) { Serial.print(R"([LOG] Cannot open )"); Serial.println(path); return false; }
 
-  Serial.print("[LOG] Dumping "); Serial.print(path);
-  if (max_bytes) { Serial.print(" ("); Serial.print(max_bytes); Serial.println(" bytes)…"); }
-  else           { Serial.println(" (all bytes)…"); }
+  Serial.print(R"([LOG] Dumping )"); Serial.print(path);
+  if (max_bytes) { Serial.print(R"( ()"); Serial.print(max_bytes); Serial.println(R"( bytes)…)"); }
+  else           { Serial.println(R"( (all bytes)…)" ); }
 
   const size_t CHUNK = 256;
-  uint8_t buf[CHUNK];
+  static uint8_t buf[CHUNK];
   uint32_t remaining = max_bytes;
   while (true) {
     size_t want = CHUNK;
@@ -456,12 +456,13 @@ static bool printLog(const char* path, uint32_t max_bytes = 0) {
     yield();
   }
   f.close();
-  Serial.println("\n[LOG] End of file.");
+  Serial.println(R"(
+[LOG] End of file.)");
   return true;
 }
 
 static bool printLogIndex(int idx, uint32_t max_bytes = 0) {
-  if (idx < 0 || idx > 999) { Serial.println("[LOG] Index out of range (0..999)"); return false; }
+  if (idx < 0 || idx > 999) { Serial.println(R"([LOG] Index out of range (0..999))"); return false; }
   char path[16]; snprintf(path, sizeof(path), "/LOG%03d.CSV", idx);
   return printLog(path, max_bytes);
 }
