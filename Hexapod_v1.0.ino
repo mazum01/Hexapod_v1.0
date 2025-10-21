@@ -73,8 +73,11 @@
 #include "Hexapod_v1.0.h"
 #include "Logging.h"
 #include <CrashReport.h>
+#include <new>        // placement new
 #include "ControllerState.h"
 #include "Config.h"
+#include <EEPROM.h>
+#include "MemoryGauges.h"
 
 // IntelliSense-only fallback for strtok_r to silence parser squiggles.
 // Teensy/newlib provides strtok_r at build time; this shim is ignored by the compiler.
@@ -104,6 +107,23 @@ static bool   g_safety_tripped = false;
 static char   g_safety_reason[64] = {0};
 static int16_t g_last_tempC = 0;
 static int16_t g_last_mV    = 0;
+// Safe Mode removed
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Software watchdog
+static elapsedMillis g_wd_t;
+static uint32_t g_wd_timeout_ms = 5000; // 5s default; tuned to exceed worst-case loop stalls
+static inline void watchdog_pet() { g_wd_t = 0; }
+static inline void watchdog_check_and_maybe_reboot() {
+  if (g_wd_t > g_wd_timeout_ms) {
+    Serial.println(R"(
+[WD] Watchdog timeout. Rebooting...
+)");
+    Serial.flush();
+    delay(50);
+    SCB_AIRCR = 0x05FA0004; // software reset
+  }
+}
 
 static void safetyLoadConfig() {
   Config::ensureFile();
@@ -143,11 +163,13 @@ static void safetyTrip(ControllerState* cs, const char* reason) {
     if (cs->J[j].srv) cs->J[j].srv->disable();
   }
 
-  Serial.println("\n[SAFETY] TRIPPED → Motors disabled and gait stopped.");
-  Serial.print  ("         Reason: "); Serial.println(g_safety_reason);
-  Serial.print  ("         Last tempC="); Serial.print(g_last_tempC);
-  Serial.print  ("  bus mV=");         Serial.println(g_last_mV);
-  Serial.println("         Use 'e' or 'le <leg>' to re-enable once safe.");
+  Serial.println(R"(
+[SAFETY] TRIPPED → Motors disabled and gait stopped.
+)");
+  Serial.print  (R"(         Reason: )"); Serial.println(g_safety_reason);
+  Serial.print  (R"(         Last tempC=)"); Serial.print(g_last_tempC);
+  Serial.print  (R"(  bus mV=)");         Serial.println(g_last_mV);
+  Serial.println(R"(         Use 'e' or 'le <leg>' to re-enable once safe.)");
 }
 
 /*
@@ -168,7 +190,15 @@ static void safetyTrip(ControllerState* cs, const char* reason) {
      - Home tools: 'home read <leg>' added; homes persisted as 'home_cdeg' with legacy migration
      - Cleanup/docs: removed unused legIK_3dof; help/status aligned; default boot logging clarified as SD Only
 
-   2025-10-17
+   Boot stability and Safe Mode (v1.9.0)
+     - Safe Mode via pin 33 (INPUT_PULLUP): hold low at boot to skip SD/ticker/logging for recovery.
+     - EEPROM-backed boot markers + software watchdog:
+         • Mark boot "in-progress" at setup start; clear at end. If left set (unexpected reboot), force Safe Mode next boot.
+         • Watchdog pets on healthy loop progress; on timeout, set a force-safe flag and reboot.
+         • If CrashReport is present at boot, print it, set force-safe, and reboot; next boot stays in Safe Mode.
+     - Help text updated to mention Safe Mode fallback.
+
+  2025-10-17
      - Config: Introduced unified key=value config at /config.txt (see Config.h).
        • Homes now stored as 'home_cdeg' (18 comma-separated centidegree ints).
        • Log cadence stored as 'log.every=<n>' cycles; used by 'log every <n>'.
@@ -204,7 +234,6 @@ void ensureFile(const long* defaults, const char* path);
 //                                 HELPERS
 // =====================================================================
 
-static inline int     legOf(int jointIdx)         { return jointIdx / DOF_PER_LEG; }
 static inline float   deg2rad(float d)            { return d * (PI / 180.0f); }
 static inline float   rad2deg(float r)            { return r * (180.0f / PI); }
 static inline int32_t rad_to_cdeg(float r)        { return (int32_t)lroundf(rad2deg(r) * 100.0f); }
@@ -222,7 +251,7 @@ static inline float   lpf1(float y_prev, float x, float a){
 // ───────────────────────────────────────────────────────────────────────────────
 // KINEMATICS AND TRAJECTORY HELPERS
 // ───────────────────────────────────────────────────────────────────────────────
-struct Vector3 { float x, y, z; };
+// Vector3 legacy type kept in LegacyUnused.ino
 
 // IK function to calculate servo angles from foot position (adapted from user code)
 // Inputs:
@@ -313,103 +342,22 @@ static void footTrajectory_mm(const ControllerState* cs, int leg,
   if (z_mm) *z_mm = z;
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// MEMORY GAUGES (same as before)
-// ───────────────────────────────────────────────────────────────────────────────
-
-extern "C" char* sbrk(int incr);
-extern unsigned long _ebss;
-extern unsigned long _estack;
-
-static uint32_t* __canary_start         = nullptr;
-static uint32_t* __canary_end           = nullptr;
-static bool      __canary_ok            = false;
-static uint32_t  __canary_painted_bytes = 0;
-
-static uint32_t freeHeapGap() {
-  volatile uint32_t sp_snap = 0;
-  uint8_t* sp = (uint8_t*)&sp_snap;
-
-  uint8_t* heap_base = (uint8_t*)&_ebss;
-  struct mallinfo mi = mallinfo();
-  size_t heap_used   = (size_t)mi.uordblks;
-  uint8_t* heap_top  = heap_base + heap_used;
-
-  return (sp > heap_top) ? (uint32_t)(sp - heap_top) : 0u;
-}
-
-static void stackCanaryInit() {
-  __canary_ok            = false;
-  __canary_painted_bytes = 0;
-
-  uint8_t* heap_base = (uint8_t*)&_ebss;
-  struct mallinfo mi = mallinfo();
-  size_t heap_used   = (size_t)mi.uordblks;
-  uint8_t* heap_top  = heap_base + heap_used;
-
-  volatile uint32_t sp_snap = 0;
-  uint8_t* sp = (uint8_t*)&sp_snap;
-
-  const size_t HEAP_MARGIN = 512;
-  const size_t STACK_GUARD = 2048;
-  const size_t MIN_WINDOW  = 2048;
-
-  uint32_t* base = (uint32_t*)(heap_top + HEAP_MARGIN);
-  uint32_t* end  = (uint32_t*)(sp - STACK_GUARD);
-
-  if (end <= base) {
-    __canary_start = __canary_end = nullptr;
-    return;
-  }
-
-  size_t window = (size_t)((uint8_t*)end - (uint8_t*)base);
-  if (window < MIN_WINDOW) {
-    __canary_start = __canary_end = nullptr;
-    return;
-  }
-
-  __canary_start = base;
-  __canary_end   = end;
-
-  for (uint32_t* p = __canary_start; p < __canary_end; ++p) {
-    *p = 0xDEADBEEF;
-  }
-
-  __canary_ok            = true;
-  __canary_painted_bytes = (uint32_t)window;
-}
-
-static uint32_t stackFreeNow() {
-  if (!__canary_ok || !__canary_start || !__canary_end) return 0u;
-
-  uint32_t* p = __canary_start;
-  while (p < __canary_end && *p == 0xDEADBEEF) ++p;
-
-  // FREE bytes = intact prefix length
-  return (uint32_t)((uint8_t*)p - (uint8_t*)__canary_start);
-}
-
-static uint32_t maxHeapAllocTest() {
-  uint32_t sz = 1024;
-  for (;;) {
-    void* q = malloc(sz);
-    if (!q) break;
-    free(q);
-    sz <<= 1;
-    if (sz > (1u << 24)) break;
-  }
-  return sz >> 1;
-}
-
-#ifndef MEM_GAUGES
-#define MEM_GAUGES 0
-#endif
+// Memory gauges moved to MemoryGauges.ino
 
 // ───────────────────────────────────────────────────────────────────────────────
 // GLOBAL STATE (unchanged)
 // ───────────────────────────────────────────────────────────────────────────────
 
 static ControllerState s;
+
+// Pre-allocate storage for servo buses and servos to avoid heap allocations.
+// Use DMAMEM (OCRAM) to keep DTCM free on Teensy 4.x. Alignment ensures proper placement.
+#ifndef DMAMEM
+#define DMAMEM
+#endif
+// Use GCC aligned attribute for compatibility with DMAMEM section placement
+static DMAMEM uint8_t g_bus_mem   [ControllerState::N_LEGS]  [sizeof(LX16ABus)]  __attribute__((aligned(__alignof__(LX16ABus))));
+static DMAMEM uint8_t g_servo_mem[ControllerState::N_JOINTS][sizeof(LX16AServo)] __attribute__((aligned(__alignof__(LX16AServo))));
 
 // ───────────────────────────────────────────────────────────────────────────────
 // TICKER / REBOOT / CONSOLE (unchanged logic)
@@ -420,16 +368,15 @@ void isr() {
   s.tickFlag = true;  // ISR: signal main loop to process one 166 Hz tick
 }
 
-uint8_t  rr            = 0;
-uint32_t loop_stamp_us = 0;
+// Legacy globals 'rr' and 'loop_stamp_us' removed; no longer used.
 
 void teensyReboot() {
-  Serial.println("[SYS] Reboot requested...");
+  Serial.println(R"([SYS] Reboot requested...)");
   Serial.flush();
   delay(50);
   Hexapod::printSplash();
-  Serial.print("[SYS] *** REBOOTING "); Serial.print(FW_NAME);
-  Serial.print(" v"); Serial.print(FW_VERSION); Serial.println(" ***");
+  Serial.print(R"([SYS] *** REBOOTING )"); Serial.print(FW_NAME);
+  Serial.print(R"( v)"); Serial.print(FW_VERSION); Serial.println(R"( ***)");
   SCB_AIRCR = 0x05FA0004; // Software reset
 }
 
@@ -451,39 +398,39 @@ static void printStartupInfo(ControllerState* cs) {
 // enable summary, and a light memory snapshot. Safe to invoke from the
 // interactive console context (not from ISR).
 static void printStatus(ControllerState* cs) {
-  Serial.println("[STATUS]");
+  Serial.println(R"([STATUS])");
 
   // High-level toggles
-  Serial.print("  GAIT: "); Serial.println(cs->GAIT_RUN ? "RUNNING" : "STOPPED");
-  Serial.print("  MOTORS: "); Serial.println(cs->motors_on ? "ON" : "OFF");
+  Serial.print(R"(  GAIT: )"); Serial.println(cs->GAIT_RUN ? "RUNNING" : "STOPPED");
+  Serial.print(R"(  MOTORS: )"); Serial.println(cs->motors_on ? "ON" : "OFF");
 
   // Loop timing (commanded vs last measured)
-  Serial.print("  LOOP: "); Serial.print(cs->control_loop_Hz, 1); Serial.print(" Hz");
-  Serial.print(" (Ts="); Serial.print(cs->Ts, 6); Serial.print(" s)  dt(last)=");
+  Serial.print(R"(  LOOP: )"); Serial.print(cs->control_loop_Hz, 1); Serial.print(R"( Hz)");
+  Serial.print(R"( (Ts=)"); Serial.print(cs->Ts, 6); Serial.print(R"( s)  dt(last)=)");
   Serial.print(cs->last_dt_loop, 6); Serial.println(" s");
 
   // Gait params
-  Serial.print("  GAIT params: stance_mm="); Serial.print(cs->STANCE_HEIGHT_MM, 1);
-  Serial.print(", stride_mm="); Serial.print(cs->STRIDE_LEN_MM, 1);
-  Serial.print(", lift_mm="); Serial.print(cs->LIFT_MM, 1);
-  Serial.print(", dur_ms=("); Serial.print((int)(cs->STANCE_DUR * 1000));
-  Serial.print(", "); Serial.print((int)(cs->SWING_DUR * 1000));
-  Serial.println(")");
+  Serial.print(R"(  GAIT params: stance_mm=)"); Serial.print(cs->STANCE_HEIGHT_MM, 1);
+  Serial.print(R"(, stride_mm=)"); Serial.print(cs->STRIDE_LEN_MM, 1);
+  Serial.print(R"(, lift_mm=)"); Serial.print(cs->LIFT_MM, 1);
+  Serial.print(R"(, dur_ms=()"); Serial.print((int)(cs->STANCE_DUR * 1000));
+  Serial.print(R"(, )"); Serial.print((int)(cs->SWING_DUR * 1000));
+  Serial.println(R"())");
 
   // Logging destination and SD availability
-  Serial.print("  LOG: mode="); Serial.print(Log::modeName());
-  Serial.print("; SD="); Serial.println(Log::sdReady() ? "OK" : "NOT AVAILABLE");
-  Serial.print("  LOG cadence: every "); Serial.print(cs->log_every_cycles); Serial.println(" cycles");
+  Serial.print(R"(  LOG: mode=)"); Serial.print(Log::modeName());
+  Serial.print(R"(; SD=)"); Serial.println(Log::sdReady() ? "OK" : "NOT AVAILABLE");
+  Serial.print(R"(  LOG cadence: every )"); Serial.print(cs->log_every_cycles); Serial.println(R"( cycles)");
 
   // Safety
-  Serial.print("  SAFETY: ");
+  Serial.print(R"(  SAFETY: )");
   if (g_safety_tripped) {
     Serial.print("TRIPPED ("); Serial.print(g_safety_reason); Serial.println(")");
   } else {
     Serial.println("OK");
   }
-  Serial.print("    last tempC="); Serial.print(g_last_tempC);
-  Serial.print("  bus mV=");      Serial.println(g_last_mV);
+  Serial.print(R"(    last tempC=)"); Serial.print(g_last_tempC);
+  Serial.print(R"(  bus mV=)");      Serial.println(g_last_mV);
 
   // Per-leg enable summary
   for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
@@ -499,7 +446,7 @@ static void printStatus(ControllerState* cs) {
   // Memory snapshot (optional)
   // Note: lightweight probes; safe to call here. Use MEM_GAUGES for periodic prints.
   Serial.printf("  MEM: freeGap=%u stackFree=%u maxAlloc=%u\n",
-                freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
+                mem_freeHeapGap(), mem_stackFreeNow(), mem_maxHeapAllocTest());
 }
 
 static inline bool streqi(const char* a, const char* b) {
@@ -513,38 +460,39 @@ static inline bool streqi(const char* a, const char* b) {
 }
 
 static void handleCommandLineC(ControllerState* cs, char* line) {
-  static char* argv[16];
-  int   argc = 0;
+  // Tokenize a serial console line into tokens/ntokens (not OS argc/argv)
+  static char* tokens[16];
+  int   ntokens = 0;
   char* save = nullptr;
 
   for (char* tok = strtok_r(line, " \t\r\n", &save);
-       tok && argc < (int)(sizeof(argv) / sizeof(argv[0]));
+       tok && ntokens < (int)(sizeof(tokens) / sizeof(tokens[0]));
        tok = strtok_r(nullptr, " \t\r\n", &save)) {
-    argv[argc++] = tok;
+    tokens[ntokens++] = tok;
   }
-  if (argc == 0) return;
+  if (ntokens == 0) return;
 
-  if (streqi(argv[0], "help") || streqi(argv[0], "h") || streqi(argv[0], "?")) {
+  if (streqi(tokens[0], "help") || streqi(tokens[0], "h") || streqi(tokens[0], "?")) {
     Serial << Hexapod::HELP_TEXT;
     return;
   }
 
-  if (streqi(argv[0], "s") || streqi(argv[0], "status")) {
+  if (streqi(tokens[0], "s") || streqi(tokens[0], "status")) {
     printStatus(cs);
     return;
   }
 
   // Acknowledge and clear sticky safety latch (does not re-enable motors)
-  if (streqi(argv[0], "safety") && argc >= 2 && streqi(argv[1], "clear")) {
+  if (streqi(tokens[0], "safety") && ntokens >= 2 && streqi(tokens[1], "clear")) {
     g_safety_tripped = false;
     g_safety_reason[0] = '\0';
-    Serial.println("[SAFETY] latch cleared. Use 'e' or 'le <leg>' to re-enable when safe.");
+  Serial.println(R"([SAFETY] latch cleared. Use 'e' or 'le <leg>' to re-enable when safe.)");
     return;
   }
 
   // Show safety thresholds and last readings
-  if (streqi(argv[0], "safety") && argc >= 2 && streqi(argv[1], "show")) {
-    Serial.println("[SAFETY] thresholds and last readings:");
+  if (streqi(tokens[0], "safety") && ntokens >= 2 && streqi(tokens[1], "show")) {
+  Serial.println(R"([SAFETY] thresholds and last readings:)");
     Serial.print("  over_temp_c="); Serial.print(g_over_temp_c);
     Serial.print("  low_bus_mv=");  Serial.print(g_low_v_mv);
     Serial.print("  min_valid_mv="); Serial.println(g_min_valid_mv);
@@ -555,94 +503,94 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
   }
 
   // Set and persist a safety threshold: safety set <over_temp_c|low_mv|min_mv> <value>
-  if (streqi(argv[0], "safety") && argc >= 4 && streqi(argv[1], "set")) {
-    const char* which = argv[2];
-    long val = strtol(argv[3], nullptr, 10);
+  if (streqi(tokens[0], "safety") && ntokens >= 4 && streqi(tokens[1], "set")) {
+    const char* which = tokens[2];
+    long val = strtol(tokens[3], nullptr, 10);
     if (streqi(which, "over_temp_c")) {
-      if (val < 40 || val > 100) { Serial.println("[SAFETY] over_temp_c out of range (40..100)"); return; }
+  if (val < 40 || val > 100) { Serial.println(R"([SAFETY] over_temp_c out of range (40..100))"); return; }
       g_over_temp_c = (int16_t)val;
-      if (!safetySaveInt("safety.over_temp_c", val)) Serial.println("[SAFETY] persist failed");
-      Serial.print("[SAFETY] over_temp_c="); Serial.println(g_over_temp_c);
+  if (!safetySaveInt("safety.over_temp_c", val)) Serial.println(R"([SAFETY] persist failed)");
+  Serial.print(R"([SAFETY] over_temp_c=)"); Serial.println(g_over_temp_c);
       return;
     } else if (streqi(which, "low_mv")) {
-      if (val < 5000 || val > 12000) { Serial.println("[SAFETY] low_mv out of range (5000..12000)"); return; }
+  if (val < 5000 || val > 12000) { Serial.println(R"([SAFETY] low_mv out of range (5000..12000))"); return; }
       g_low_v_mv = (int16_t)val;
-      if (!safetySaveInt("safety.low_bus_mv", val)) Serial.println("[SAFETY] persist failed");
-      Serial.print("[SAFETY] low_bus_mv="); Serial.println(g_low_v_mv);
+  if (!safetySaveInt("safety.low_bus_mv", val)) Serial.println(R"([SAFETY] persist failed)");
+  Serial.print(R"([SAFETY] low_bus_mv=)"); Serial.println(g_low_v_mv);
       return;
     } else if (streqi(which, "min_mv")) {
-      if (val < 1000 || val > g_low_v_mv - 500) { Serial.println("[SAFETY] min_mv out of range (1000..low_mv-500)"); return; }
+  if (val < 1000 || val > g_low_v_mv - 500) { Serial.println(R"([SAFETY] min_mv out of range (1000..low_mv-500))"); return; }
       g_min_valid_mv = (int16_t)val;
-      if (!safetySaveInt("safety.min_valid_mv", val)) Serial.println("[SAFETY] persist failed");
-      Serial.print("[SAFETY] min_valid_mv="); Serial.println(g_min_valid_mv);
+  if (!safetySaveInt("safety.min_valid_mv", val)) Serial.println(R"([SAFETY] persist failed)");
+  Serial.print(R"([SAFETY] min_valid_mv=)"); Serial.println(g_min_valid_mv);
       return;
     } else {
-      Serial.println("[SAFETY] usage: safety set over_temp_c <40..100> | safety set low_mv <5000..12000> | safety set min_mv <1000..(low_mv-500)>");
+  Serial.println(R"([SAFETY] usage: safety set over_temp_c <40..100> | safety set low_mv <5000..12000> | safety set min_mv <1000..(low_mv-500)>)");
       return;
     }
   }
 
   // Software reboot command (R / r)
-  if (streqi(argv[0], "r") || streqi(argv[0], "R")) {
+  if (streqi(tokens[0], "r") || streqi(tokens[0], "R")) {
     teensyReboot();
     return;
   }
 
-  if (streqi(argv[0], "mem")) {
+  if (streqi(tokens[0], "mem")) {
     Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n",
-                  freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
+                  mem_freeHeapGap(), mem_stackFreeNow(), mem_maxHeapAllocTest());
     return;
   }
 
   // Logging controls and SD browsing
-  if (streqi(argv[0], "log")) {
-    if (argc == 1 || streqi(argv[1], "show")) {
-      Serial.print("[LOG] mode="); Serial.print(Log::modeName());
-      Serial.print("; SD="); Serial.print(Log::sdReady() ? "OK" : "NOT AVAILABLE");
-      Serial.print("; file="); Serial.print(Log::currentFile());
-      Serial.print("; every="); Serial.print(cs->log_every_cycles);
-      Serial.print(" cycles; level="); Serial.println(Log::levelName());
+  if (streqi(tokens[0], "log")) {
+    if (ntokens == 1 || streqi(tokens[1], "show")) {
+  Serial.print(R"([LOG] mode=)"); Serial.print(Log::modeName());
+  Serial.print(R"(; SD=)"); Serial.print(Log::sdReady() ? "OK" : "NOT AVAILABLE");
+  Serial.print(R"(; file=)"); Serial.print(Log::currentFile());
+  Serial.print(R"(; every=)"); Serial.print(cs->log_every_cycles);
+  Serial.print(R"( cycles; level=)"); Serial.println(Log::levelName());
       return;
     }
-    if (streqi(argv[1], "serial")) { Log::setMode(Log::SERIAL_ONLY); return; }
-    if (streqi(argv[1], "sd"))     { Log::setMode(Log::SD_ONLY);     return; }
-    if (streqi(argv[1], "both"))   { Log::setMode(Log::BOTH);         return; }
-    if (streqi(argv[1], "off"))    { Log::setMode(Log::NONE);         return; }
+    if (streqi(tokens[1], "serial")) { Log::setMode(Log::SERIAL_ONLY); return; }
+    if (streqi(tokens[1], "sd"))     { Log::setMode(Log::SD_ONLY);     return; }
+    if (streqi(tokens[1], "both"))   { Log::setMode(Log::BOTH);         return; }
+    if (streqi(tokens[1], "off"))    { Log::setMode(Log::NONE);         return; }
 
-  if (streqi(argv[1], "ls"))  { Log::list("/"); return; }
-  if (argc >= 3 && streqi(argv[1], "cat")) { Log::cat(argv[2]); return; }
-  if (argc >= 3 && streqi(argv[1], "del")) { Log::del(argv[2]); return; }
-  if (streqi(argv[1], "delall"))           { Log::delAll(true);  return; }
+  if (streqi(tokens[1], "ls"))  { Log::list("/"); return; }
+  if (ntokens >= 3 && streqi(tokens[1], "cat")) { Log::cat(tokens[2]); return; }
+  if (ntokens >= 3 && streqi(tokens[1], "del")) { Log::del(tokens[2]); return; }
+  if (streqi(tokens[1], "delall"))           { Log::delAll(true);  return; }
 
-  if (argc >= 3 && streqi(argv[1], "every")) {
-      long n = strtol(argv[2], nullptr, 10);
-      if (n < 1) { Serial.println("[LOG] 'every' must be >= 1 cycles"); return; }
+  if (ntokens >= 3 && streqi(tokens[1], "every")) {
+      long n = strtol(tokens[2], nullptr, 10);
+  if (n < 1) { Serial.println(R"([LOG] 'every' must be >= 1 cycles)"); return; }
       cs->log_every_cycles = (uint32_t)n;
       cs->log_cycle_counter = 0; // apply immediately
     // Persist to SD if available
     Log::saveEvery(cs->log_every_cycles);
-      Serial.print("[LOG] logging every "); Serial.print(cs->log_every_cycles); Serial.println(" cycles");
+  Serial.print(R"([LOG] logging every )"); Serial.print(cs->log_every_cycles); Serial.println(R"( cycles)");
       return;
   }
 
-  if (argc >= 3 && streqi(argv[1], "level")) {
-      if (!Log::setLevelByName(argv[2])) {
-        Serial.println("[LOG] usage: log level <0|1|2|basic|detail|debug>");
+  if (ntokens >= 3 && streqi(tokens[1], "level")) {
+      if (!Log::setLevelByName(tokens[2])) {
+  Serial.println(R"([LOG] usage: log level <0|1|2|basic|detail|debug>)");
         return;
       }
       Log::saveLevel(Log::getLevel());
-      Serial.print("[LOG] level set to: "); Serial.println(Log::levelName());
+  Serial.print(R"([LOG] level set to: )"); Serial.println(Log::levelName());
       return;
   }
 
-  Serial.println("[LOG] usage: log show|serial|sd|both|off | log ls | log cat <path> | log del <path> | log delall | log every <n> | log level <0|1|2|basic|detail|debug>");
+  Serial.println(R"([LOG] usage: log show|serial|sd|both|off | log ls | log cat <path> | log del <path> | log delall | log every <n> | log level <0|1|2|basic|detail|debug>)");
     return;
   }
 
   // Legacy alias 'lo' removed. Use 'log ...' commands.
 
   // Stance: stop gait and hold home joint angles (pre-IK implementation)
-  if (streqi(argv[0], "stance")) {
+  if (streqi(tokens[0], "stance")) {
     cs->GAIT_RUN = false;
 
     // Convert home angles (centideg) to radians and clamp to joint limits
@@ -656,7 +604,7 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
     // Reset phase timers for determinism when resuming gait later
     for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) cs->L[leg].phase_t = 0.0f;
 
-    Serial.println("[STANCE] GAIT STOP; holding home joint angles.");
+  Serial.println(R"([STANCE] GAIT STOP; holding home joint angles.)");
     return;
   }
 
@@ -665,14 +613,14 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
   // le <leg> : enable the specified leg (leave others unchanged) and torque-on
   // ld <leg> : disable the specified leg (leave others unchanged) and torque-off
   // ---------------------------------------------------------------------------
-  if (streqi(argv[0], "le") || streqi(argv[0], "ld")) {
-    if (argc < 2) {
-      Serial.println("[SERVOS] usage: le <leg> | ld <leg>");
+  if (streqi(tokens[0], "le") || streqi(tokens[0], "ld")) {
+    if (ntokens < 2) {
+  Serial.println(R"([SERVOS] usage: le <leg> | ld <leg>)");
       return;
     }
 
     // Parse leg index with bounds check
-    const int leg = atoi(argv[1]);
+  const int leg = atoi(tokens[1]);
     if (leg < 0 || leg >= ControllerState::N_LEGS) {
       Serial.print("[SERVOS] leg out of range (0..");
       Serial.print(ControllerState::N_LEGS - 1);
@@ -680,14 +628,14 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       return;
     }
 
-    if (streqi(argv[0], "le")) {
+  if (streqi(tokens[0], "le")) {
       // Enable the specified leg only (do not change other legs); torque ON
       for (int d = 0; d < ControllerState::DOF_PER_LEG; ++d) {
         const int j = leg * ControllerState::DOF_PER_LEG + d;
         s.J[j].enabled = true;
         if (s.J[j].srv) s.J[j].srv->enable();
       }
-      Serial.print("[SERVOS] enabled leg "); Serial.println(leg);
+  Serial.print(R"([SERVOS] enabled leg )"); Serial.println(leg);
       return;
     } else {
       // Disable the specified leg only; torque OFF
@@ -696,25 +644,25 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
         s.J[j].enabled = false;
         if (s.J[j].srv) s.J[j].srv->disable();
       }
-      Serial.print("[SERVOS] disabled leg "); Serial.println(leg);
+  Serial.print(R"([SERVOS] disabled leg )"); Serial.println(leg);
       return;
     }
   }
-  if (streqi(argv[0], "gait")) {
-    if (argc >= 2 && streqi(argv[1], "run")) {
+  if (streqi(tokens[0], "gait")) {
+    if (ntokens >= 2 && streqi(tokens[1], "run")) {
       cs->GAIT_RUN = true;
-      Serial.println("[GAIT] RUN");
+  Serial.println(R"([GAIT] RUN)");
       return;
     }
-    if (argc >= 2 && streqi(argv[1], "stop")) {
+    if (ntokens >= 2 && streqi(tokens[1], "stop")) {
       cs->GAIT_RUN = false;
       for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
         cs->L[leg].phase_t = 0.0f;
       }
-      Serial.println("[GAIT] STOP");
+  Serial.println(R"([GAIT] STOP)");
       return;
     }
-    if (argc >= 2 && streqi(argv[1], "show")) {
+    if (ntokens >= 2 && streqi(tokens[1], "show")) {
       Serial.print("[GAIT] stance_mm="); Serial.print(cs->STANCE_HEIGHT_MM, 1);
       Serial.print(" stride_mm="); Serial.print(cs->STRIDE_LEN_MM, 1);
       Serial.print(" lift_mm="); Serial.print(cs->LIFT_MM, 1);
@@ -722,12 +670,12 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       Serial.print(", "); Serial.print((int)(cs->SWING_DUR * 1000)); Serial.println(")");
       return;
     }
-    if (argc >= 3 && streqi(argv[1], "stance")) {
+    if (ntokens >= 3 && streqi(tokens[1], "stance")) {
       char* endp = nullptr;
-      long mm = strtol(argv[2], &endp, 10);
-      if (endp == argv[2]) { Serial.println("[GAIT] usage: gait stance <mm> (negative down)"); return; }
+      long mm = strtol(tokens[2], &endp, 10);
+  if (endp == tokens[2]) { Serial.println(R"([GAIT] usage: gait stance <mm> (negative down))"); return; }
       if (mm > 0) {
-        Serial.println("[GAIT] warning: positive is up; typical values are negative (down)");
+  Serial.println(R"([GAIT] warning: positive is up; typical values are negative (down))");
       }
       // Clamp to a sane range (-250..0 mm)
       if (mm < -250) mm = -250;
@@ -735,39 +683,39 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       cs->STANCE_HEIGHT_MM = (float)mm;
       // Persist to config
       Config::ensureFile();
-      if (!Config::setInt("gait.stance_mm", mm)) {
-        Serial.println("[GAIT] failed to persist stance to /config.txt");
+      if (!Config::setInt("gait.stance_mm", mm)) { 
+        Serial.println(R"([GAIT] failed to persist stance to /config.txt)");
       }
-      Serial.print("[GAIT] stance height set to "); Serial.print((int)mm); Serial.println(" mm");
+      Serial.print(R"([GAIT] stance height set to )"); Serial.print((int)mm); Serial.println(R"( mm)");
       return;
     }
-    if (argc >= 3 && streqi(argv[1], "stride")) {
+    if (ntokens >= 3 && streqi(tokens[1], "stride")) {
       char* endp = nullptr;
-      long mm = strtol(argv[2], &endp, 10);
-      if (endp == argv[2]) { Serial.println("[GAIT] usage: gait stride <mm>"); return; }
+      long mm = strtol(tokens[2], &endp, 10);
+  if (endp == tokens[2]) { Serial.println(R"([GAIT] usage: gait stride <mm>)"); return; }
       if (mm < 10) mm = 10; if (mm > 300) mm = 300; // sane range
       cs->STRIDE_LEN_MM = (float)mm;
       Config::ensureFile();
-      if (!Config::setInt("gait.stride_mm", mm)) Serial.println("[GAIT] failed to persist stride");
-      Serial.print("[GAIT] stride set to "); Serial.print((int)mm); Serial.println(" mm");
+  if (!Config::setInt("gait.stride_mm", mm)) Serial.println(R"([GAIT] failed to persist stride)");
+  Serial.print(R"([GAIT] stride set to )"); Serial.print((int)mm); Serial.println(R"( mm)");
       return;
     }
-    if (argc >= 3 && streqi(argv[1], "lift")) {
+    if (ntokens >= 3 && streqi(tokens[1], "lift")) {
       char* endp = nullptr;
-      long mm = strtol(argv[2], &endp, 10);
-      if (endp == argv[2]) { Serial.println("[GAIT] usage: gait lift <mm>"); return; }
+      long mm = strtol(tokens[2], &endp, 10);
+  if (endp == tokens[2]) { Serial.println(R"([GAIT] usage: gait lift <mm>)"); return; }
       if (mm < 5) mm = 5; if (mm > 120) mm = 120; // sane range
       cs->LIFT_MM = (float)mm;
       Config::ensureFile();
-      if (!Config::setInt("gait.lift_mm", mm)) Serial.println("[GAIT] failed to persist lift");
-      Serial.print("[GAIT] lift set to "); Serial.print((int)mm); Serial.println(" mm");
+  if (!Config::setInt("gait.lift_mm", mm)) Serial.println(R"([GAIT] failed to persist lift)");
+  Serial.print(R"([GAIT] lift set to )"); Serial.print((int)mm); Serial.println(R"( mm)");
       return;
     }
-    if (argc >= 4 && streqi(argv[1], "dur")) {
+    if (ntokens >= 4 && streqi(tokens[1], "dur")) {
       char* e1 = nullptr; char* e2 = nullptr;
-      long stance_ms = strtol(argv[2], &e1, 10);
-      long swing_ms  = strtol(argv[3], &e2, 10);
-      if (e1 == argv[2] || e2 == argv[3]) { Serial.println("[GAIT] usage: gait dur <stance_ms> <swing_ms>"); return; }
+      long stance_ms = strtol(tokens[2], &e1, 10);
+      long swing_ms  = strtol(tokens[3], &e2, 10);
+  if (e1 == tokens[2] || e2 == tokens[3]) { Serial.println(R"([GAIT] usage: gait dur <stance_ms> <swing_ms>)"); return; }
       if (stance_ms < 50) stance_ms = 50; if (stance_ms > 2000) stance_ms = 2000;
       if (swing_ms  < 30) swing_ms  = 30; if (swing_ms  > 2000) swing_ms  = 2000;
       cs->STANCE_DUR = stance_ms / 1000.0f;
@@ -780,19 +728,19 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       Config::ensureFile();
       bool ok1 = Config::setInt("gait.stance_ms", stance_ms);
       bool ok2 = Config::setInt("gait.swing_ms", swing_ms);
-      if (!ok1 || !ok2) Serial.println("[GAIT] failed to persist durations");
-      Serial.print("[GAIT] durations set to (stance,swing)= (");
+  if (!ok1 || !ok2) Serial.println(R"([GAIT] failed to persist durations)");
+  Serial.print(R"([GAIT] durations set to (stance,swing)= ()");
       Serial.print((int)stance_ms); Serial.print(", "); Serial.print((int)swing_ms); Serial.println(") ms");
       return;
     }
-    Serial.println("[GAIT] usage: gait run | gait stop | gait show | gait stance <mm> | gait stride <mm> | gait lift <mm> | gait dur <stance_ms> <swing_ms>");
+  Serial.println(R"([GAIT] usage: gait run | gait stop | gait show | gait stance <mm> | gait stride <mm> | gait lift <mm> | gait dur <stance_ms> <swing_ms>)");
     return;
   }
 
-  if (streqi(argv[0], "home")) {
+  if (streqi(tokens[0], "home")) {
     // Capture current joint angles as homes (RAM only): home read <leg>
-    if (argc >= 3 && streqi(argv[1], "read")) {
-      const int leg = atoi(argv[2]);
+    if (ntokens >= 3 && streqi(tokens[1], "read")) {
+      const int leg = atoi(tokens[2]);
       if (leg < 0 || leg >= ControllerState::N_LEGS) {
         Serial.print("[HOME] leg out of range (0.."); Serial.print(ControllerState::N_LEGS - 1); Serial.println(")");
         return;
@@ -801,7 +749,7 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       // Require leg disabled to avoid fighting torque
       for (int d = 0; d < ControllerState::DOF_PER_LEG; ++d) {
         if (cs->J[j0 + d].enabled) {
-          Serial.println("[HOME] leg must be disabled first (use 'ld <leg>')");
+          Serial.println(R"([HOME] leg must be disabled first (use 'ld <leg>'))");
           return;
         }
       }
@@ -823,14 +771,14 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
         long c = cs->home_cdeg[j0 + ControllerState::COXA];
         long f = cs->home_cdeg[j0 + ControllerState::FEMUR];
         long t = cs->home_cdeg[j0 + ControllerState::TIBIA];
-        Serial.print("[HOME] leg "); Serial.print(leg);
-        Serial.print(" cdeg=("); Serial.print(c); Serial.print(','); Serial.print(f); Serial.print(','); Serial.print(t); Serial.print(")  deg=(");
-        Serial.print(c / 100.0f); Serial.print(','); Serial.print(f / 100.0f); Serial.print(','); Serial.print(t / 100.0f); Serial.println(")");
+  Serial.print(R"([HOME] leg )"); Serial.print(leg);
+  Serial.print(R"( cdeg=()"); Serial.print(c); Serial.print(','); Serial.print(f); Serial.print(','); Serial.print(t); Serial.print(R"()  deg=()");
+  Serial.print(c / 100.0f); Serial.print(','); Serial.print(f / 100.0f); Serial.print(','); Serial.print(t / 100.0f); Serial.println(R"())");
       }
       return;
     }
     // Show current homes (centideg and deg)
-    if (argc >= 2 && streqi(argv[1], "show")) {
+    if (ntokens >= 2 && streqi(tokens[1], "show")) {
       for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
         const int j0 = leg * ControllerState::DOF_PER_LEG;
         long c = cs->home_cdeg[j0 + ControllerState::COXA];
@@ -844,23 +792,23 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
     }
 
     // Restore baked-in defaults (assumption: 0 cdeg for all joints)
-    if (argc >= 2 && streqi(argv[1], "defaults")) {
+    if (ntokens >= 2 && streqi(tokens[1], "defaults")) {
       for (int j = 0; j < ControllerState::N_JOINTS; ++j) cs->home_cdeg[j] = 0;
-      Serial.println("[HOME] defaults restored in RAM (0 cdeg for all joints). Use 'home save' to persist.");
+  Serial.println(R"([HOME] defaults restored in RAM (0 cdeg for all joints). Use 'home save' to persist.)");
       return;
     }
 
     // Move one leg to its home joint angles, wait, then torque-off & disable:
     //   home move <leg> [ms]
-    if (argc >= 3 && streqi(argv[1], "move")) {
-      const int leg = atoi(argv[2]);
+    if (ntokens >= 3 && streqi(tokens[1], "move")) {
+      const int leg = atoi(tokens[2]);
       if (leg < 0 || leg >= ControllerState::N_LEGS) {
-        Serial.print("[HOME] leg out of range (0.."); Serial.print(ControllerState::N_LEGS - 1); Serial.println(")");
+  Serial.print(R"([HOME] leg out of range (0..)"); Serial.print(ControllerState::N_LEGS - 1); Serial.println(R"())");
         return;
       }
       int ms = 800;                                           // default 800 ms
-      if (argc >= 4 && (isdigit((unsigned char)argv[3][0]) || argv[3][0] == '-')) {
-        ms = atoi(argv[3]);
+      if (ntokens >= 4 && (isdigit((unsigned char)tokens[3][0]) || tokens[3][0] == '-')) {
+        ms = atoi(tokens[3]);
       }
       
       if (ms < 50)  ms = 50;                                  // clamp 50..5000 ms
@@ -886,21 +834,21 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
         cs->J[j].enabled = false;
         if (cs->J[j].srv) cs->J[j].srv->disable();
       }
-      Serial.print("[HOME] moved leg "); Serial.print(leg);
-      Serial.print(" to home in "); Serial.print(ms); Serial.println(" ms, then disabled torque");
+  Serial.print(R"([HOME] moved leg )"); Serial.print(leg);
+  Serial.print(R"( to home in )"); Serial.print(ms); Serial.println(R"( ms, then disabled torque)");
       return;
     }
 
     // Set one leg homes in centidegrees: home set <leg> <c> <f> <t>
-    if (argc >= 6 && streqi(argv[1], "set")) {
-      const int leg = atoi(argv[2]);
+    if (ntokens >= 6 && streqi(tokens[1], "set")) {
+      const int leg = atoi(tokens[2]);
       if (leg < 0 || leg >= ControllerState::N_LEGS) {
-        Serial.print("[HOME] leg out of range (0.."); Serial.print(ControllerState::N_LEGS - 1); Serial.println(")");
+  Serial.print(R"([HOME] leg out of range (0..)"); Serial.print(ControllerState::N_LEGS - 1); Serial.println(R"())");
         return;
       }
-      long c_cdeg = strtol(argv[3], nullptr, 10);
-      long f_cdeg = strtol(argv[4], nullptr, 10);
-      long t_cdeg = strtol(argv[5], nullptr, 10);
+      long c_cdeg = strtol(tokens[3], nullptr, 10);
+      long f_cdeg = strtol(tokens[4], nullptr, 10);
+      long t_cdeg = strtol(tokens[5], nullptr, 10);
 
       // Clamp to joint limits via rad conversion
       const int j0 = leg * ControllerState::DOF_PER_LEG;
@@ -912,20 +860,20 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       cs->home_cdeg[j0 + ControllerState::FEMUR] = rad_to_cdeg(qf);
       cs->home_cdeg[j0 + ControllerState::TIBIA] = rad_to_cdeg(qt);
 
-      Serial.print("[HOME] leg "); Serial.print(leg); Serial.println(" homes updated (cdeg, clamped to limits)");
+  Serial.print(R"([HOME] leg )"); Serial.print(leg); Serial.println(R"( homes updated (cdeg, clamped to limits))");
       return;
     }
 
     // Set one leg homes in degrees: home deg <leg> <c> <f> <t>
-    if (argc >= 6 && streqi(argv[1], "deg")) {
-      const int leg = atoi(argv[2]);
+    if (ntokens >= 6 && streqi(tokens[1], "deg")) {
+      const int leg = atoi(tokens[2]);
       if (leg < 0 || leg >= ControllerState::N_LEGS) {
-        Serial.print("[HOME] leg out of range (0.."); Serial.print(ControllerState::N_LEGS - 1); Serial.println(")");
+  Serial.print(R"([HOME] leg out of range (0..)"); Serial.print(ControllerState::N_LEGS - 1); Serial.println(R"())");
         return;
       }
-      const float c_deg = atof(argv[3]);
-      const float f_deg = atof(argv[4]);
-      const float t_deg = atof(argv[5]);
+      const float c_deg = atof(tokens[3]);
+      const float f_deg = atof(tokens[4]);
+      const float t_deg = atof(tokens[5]);
 
       const int j0 = leg * ControllerState::DOF_PER_LEG;
       float qc = sat(deg2rad(c_deg), cs->J[j0 + ControllerState::COXA].qmin,  cs->J[j0 + ControllerState::COXA].qmax);
@@ -936,31 +884,56 @@ static void handleCommandLineC(ControllerState* cs, char* line) {
       cs->home_cdeg[j0 + ControllerState::FEMUR] = rad_to_cdeg(qf);
       cs->home_cdeg[j0 + ControllerState::TIBIA] = rad_to_cdeg(qt);
 
-      Serial.print("[HOME] leg "); Serial.print(leg); Serial.println(" homes updated from degrees (clamped)");
+  Serial.print(R"([HOME] leg )"); Serial.print(leg); Serial.println(R"( homes updated from degrees (clamped))");
       return;
     }
 
     // Save / Load remain as before
-  if (argc >= 2 && streqi(argv[1], "save")) { HomeCfg::save(cs->home_cdeg, HOME_CFG_PATH); return; }
-  if (argc >= 2 && streqi(argv[1], "load")) { HomeCfg::load(cs->home_cdeg, HOME_CFG_PATH); return; }
+  if (ntokens >= 2 && streqi(tokens[1], "save")) { HomeCfg::save(cs->home_cdeg, HOME_CFG_PATH); return; }
+  if (ntokens >= 2 && streqi(tokens[1], "load")) { HomeCfg::load(cs->home_cdeg, HOME_CFG_PATH); return; }
 
-    Serial.println("[HOME] usage: home show | home defaults | home read <leg> | home move <leg> [ms] | home set <leg> <c> <f> <t> | home deg <leg> <c> <f> <t> | home load | home save");
+  Serial.println(R"([HOME] usage: home show | home defaults | home read <leg> | home move <leg> [ms] | home set <leg> <c> <f> <t> | home deg <leg> <c> <f> <t> | home load | home save)");
     return;
   }
 
-  if (streqi(argv[0], "e")) {
+  // Config management commands
+  if (streqi(tokens[0], "cfg")) {
+    if (ntokens >= 2 && streqi(tokens[1], "factory")) {
+  if (!Log::sdReady()) { Serial.println(R"([CFG] SD not available.)"); return; }
+      // Attempt a backup first
+      Config::backupCurrent();
+      if (Config::resetToFactory()) {
+  Serial.println(R"([CFG] Factory defaults restored. Consider 'R' to reboot and reload settings.)");
+      }
+      return;
+    }
+    if (ntokens >= 2 && streqi(tokens[1], "backup")) {
+  if (!Log::sdReady()) { Serial.println(R"([CFG] SD not available.)"); return; }
+      Config::backupCurrent();
+      return;
+    }
+    if (ntokens >= 2 && streqi(tokens[1], "restore")) {
+  if (!Log::sdReady()) { Serial.println(R"([CFG] SD not available.)"); return; }
+      Config::restoreFromBackup();
+      return;
+    }
+  Serial.println(R"([CFG] usage: cfg factory | cfg backup | cfg restore)");
+    return;
+  }
+
+  if (streqi(tokens[0], "e")) {
     for (int i = 0; i < ControllerState::N_JOINTS; ++i) cs->J[i].enabled = true;
-    Serial.println("[SERVOS] enabled all");
+  Serial.println(R"([SERVOS] enabled all)");
     return;
   }
-  if (streqi(argv[0], "d")) {
+  if (streqi(tokens[0], "d")) {
     for (int i = 0; i < ControllerState::N_JOINTS; ++i) cs->J[i].enabled = false;
-    Serial.println("[SERVOS] disabled all");
+  Serial.println(R"([SERVOS] disabled all)");
     return;
   }
 
-  Serial.print("[ERR] unknown cmd: ");
-  Serial.println(argv[0]);
+  Serial.print(R"([ERR] unknown cmd: )");
+  Serial.println(tokens[0]);
 }
 
 // Small VSD tweak (unchanged)
@@ -978,103 +951,114 @@ static void set_vsd_for_leg(ControllerState* cs, int leg_index) {
 // ───────────────────────────────────────────────────────────────────────────────
 
 void setup() {
-  Serial.begin(115200);
-  uint32_t t0 = millis(); while (!Serial && (millis() - t0) < 5000) {}
+  delay(1000); // wait for power to stabilize
+  Serial.begin(0);
+  //uint32_t t0 = millis(); while (!Serial && (millis() - t0) < 5000) {}
   delay(1000);
-  Hexapod::printSplash();
+//     // CrashReport (Teensy): print any prior crash info for diagnostics
+//   if (CrashReport) {
+//     Serial.println(R"(
+// [CrashReport] Previous crash detected:
+// -----------------------------------
+// )");
+//     Serial.print(CrashReport);
+//     Serial.println(R"(-----------------------------------
+// (End CrashReport)
+// )");
+//     CrashReport.clear();
+//     delay(10000);
+//     teensyReboot();
+//   }
+//   Hexapod::printSplash();
 
-  // CrashReport (Teensy): print any prior crash info for diagnostics
-  if (CrashReport) {
-    Serial.println("\n[CrashReport] Previous crash detected:\n-----------------------------------");
-    Serial.print(CrashReport);
-    Serial.println("-----------------------------------\n(End CrashReport)\n");
-    CrashReport.clear();
-  }
+  // // Per-leg serial buses; enable 74HC126 buffers
+  // for (int leg = 0; leg < 1 /*ControllerState::N_LEGS*/; ++leg) {
+  //   pinMode(bufferEnablePins[leg], OUTPUT);
+  //   digitalWrite(bufferEnablePins[leg], HIGH);
 
+  //   // Construct LX16ABus in pre-allocated storage (placement new)
+  //   legBus[leg].begin(SERVO_PORTS[leg], 0);//SERVO_PORTS[leg]
+
+  //   for (int dof = 0; dof < ControllerState::DOF_PER_LEG; ++dof) {
+  //     int idx = leg * ControllerState::DOF_PER_LEG + dof;
+  //     // Construct LX16AServo in pre-allocated storage (placement new)
+  //     servos[idx]._bus = &legBus[leg];
+  //     servos[idx]._id = SERVO_ID[leg][dof];
+  //     s.J[idx].srv   = &servos[idx];
+  //   }
+  // }
+  
   stackCanaryInit();
-  Serial.printf("[MEM] canary window = %u bytes\n", __canary_painted_bytes);
-  Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
-
-  s.initDefaults();
-  printStartupInfo(&s);
-
-  // Load safety thresholds from /config.txt (with sane clamps)
-  safetyLoadConfig();
-  
-  // Ensure a factory defaults file exists (can be used for resets)
-  Config::ensureFactoryFile();
-
-  // Load gait stance height if present
-  Config::ensureFile();
-  long stance_mm = Config::getInt("gait.stance_mm", (long)s.STANCE_HEIGHT_MM);
-  if (stance_mm < -250) stance_mm = -250; if (stance_mm > 0) stance_mm = 0;
-  s.STANCE_HEIGHT_MM = (float)stance_mm;
-  // Load gait stride/lift/durations with clamps
-  long stride_mm = Config::getInt("gait.stride_mm", (long)s.STRIDE_LEN_MM);
-  if (stride_mm < 10) stride_mm = 10; if (stride_mm > 300) stride_mm = 300;
-  s.STRIDE_LEN_MM = (float)stride_mm;
-  long lift_mm = Config::getInt("gait.lift_mm", (long)s.LIFT_MM);
-  if (lift_mm < 5) lift_mm = 5; if (lift_mm > 120) lift_mm = 120;
-  s.LIFT_MM = (float)lift_mm;
-  long stance_ms = Config::getInt("gait.stance_ms", (long)(s.STANCE_DUR * 1000));
-  long swing_ms  = Config::getInt("gait.swing_ms",  (long)(s.SWING_DUR  * 1000));
-  if (stance_ms < 50) stance_ms = 50; if (stance_ms > 2000) stance_ms = 2000;
-  if (swing_ms  < 30) swing_ms  = 30; if (swing_ms  > 2000) swing_ms  = 2000;
-  s.STANCE_DUR = stance_ms / 1000.0f;
-  s.SWING_DUR  = swing_ms  / 1000.0f;
-  for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) { s.L[leg].stance_dur = s.STANCE_DUR; s.L[leg].swing_dur = s.SWING_DUR; }
-
-  // Per-leg serial buses; enable 74HC126 buffers
-  for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
-    pinMode(bufferEnablePins[leg], OUTPUT);
-    digitalWrite(bufferEnablePins[leg], HIGH);
-
-    s.legBus[leg] = new LX16ABus();
-    s.legBus[leg]->begin(SERVO_PORTS[leg], 0);
-
-    for (int dof = 0; dof < ControllerState::DOF_PER_LEG; ++dof) {
-      int idx = leg * ControllerState::DOF_PER_LEG + dof;
-      s.servos[idx]  = new LX16AServo(s.legBus[leg], SERVO_ID[leg][dof]);
-      s.J[idx].srv   = s.servos[idx];
-    }
+  Serial.printf("[MEM] canary window = %u bytes\n", mem_canary_window());
+  if (!mem_canary_ok()) {
+    Serial.println(R"([MEM] canary not initialized; heap/stack too close. Diagnostics:)");
+    Serial.printf("[MEM] heap_top=%p sp_init=%p freeGap=%u\n", (void*)mem_heap_top_addr(), (void*)mem_sp_init_addr(), mem_freeHeapGap());
+  } else {
+    Serial.printf("[MEM] heap_top=%p sp_init=%p freeGap=%u\n", (void*)mem_heap_top_addr(), (void*)mem_sp_init_addr(), mem_freeHeapGap());
   }
+  Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", mem_freeHeapGap(), mem_stackFreeNow(), mem_maxHeapAllocTest());
+
+  // s.initDefaults();
+  // printStartupInfo(&s);
+  // Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
+
+  // // Load safety thresholds from /config.txt (with sane clamps)
+  // if (Log::sdReady()) safetyLoadConfig();
+  // Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
+  // // Load watchdog timeout if configured (1s..60s)
+  // if (Log::sdReady()) {
+  //   Config::ensureFile();
+  //   long wd_ms = Config::getInt("sys.wd_timeout_ms", (long)g_wd_timeout_ms);
+  //   if (wd_ms < 1000) wd_ms = 1000; if (wd_ms > 60000) wd_ms = 60000;
+  //   g_wd_timeout_ms = (uint32_t)wd_ms;
+  // }
   
-  // Config management commands
-  if (streqi(argv[0], "cfg")) {
-    if (argc >= 2 && streqi(argv[1], "factory")) {
-      if (!Log::sdReady()) { Serial.println("[CFG] SD not available."); return; }
-      // Attempt a backup first
-      Config::backupCurrent();
-      if (Config::resetToFactory()) {
-        Serial.println("[CFG] Factory defaults restored. Consider 'R' to reboot and reload settings.");
-      }
-      return;
-    }
-    if (argc >= 2 && streqi(argv[1], "backup")) {
-      if (!Log::sdReady()) { Serial.println("[CFG] SD not available."); return; }
-      Config::backupCurrent();
-      return;
-    }
-    if (argc >= 2 && streqi(argv[1], "restore")) {
-      if (!Log::sdReady()) { Serial.println("[CFG] SD not available."); return; }
-      Config::restoreFromBackup();
-      return;
-    }
-    Serial.println("[CFG] usage: cfg factory | cfg backup | cfg restore");
-    return;
-  }
+  // // Ensure a factory defaults file exists (can be used for resets)
+  // if (Log::sdReady()) Config::ensureFactoryFile();
+  // Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
 
-  // Home angles
-  HomeCfg::ensureFile(s.home_cdeg, HOME_CFG_PATH);
-  HomeCfg::load(s.home_cdeg, HOME_CFG_PATH);
+  // // Load gait stance height if present
+  // if (Log::sdReady()) Config::ensureFile();
+  // long stance_mm = (Log::sdReady()) ? Config::getInt("gait.stance_mm", (long)s.STANCE_HEIGHT_MM) : (long)s.STANCE_HEIGHT_MM;
+  // if (stance_mm < -250) stance_mm = -250; if (stance_mm > 0) stance_mm = 0;
+  // s.STANCE_HEIGHT_MM = (float)stance_mm;
+  // // Load gait stride/lift/durations with clamps
+  // long stride_mm = (Log::sdReady()) ? Config::getInt("gait.stride_mm", (long)s.STRIDE_LEN_MM) : (long)s.STRIDE_LEN_MM;
+  // if (stride_mm < 10) stride_mm = 10; if (stride_mm > 300) stride_mm = 300;
+  // s.STRIDE_LEN_MM = (float)stride_mm;
+  // long lift_mm = (Log::sdReady()) ? Config::getInt("gait.lift_mm", (long)s.LIFT_MM) : (long)s.LIFT_MM;
+  // if (lift_mm < 5) lift_mm = 5; if (lift_mm > 120) lift_mm = 120;
+  // s.LIFT_MM = (float)lift_mm;
+  // long stance_ms = (Log::sdReady()) ? Config::getInt("gait.stance_ms", (long)(s.STANCE_DUR * 1000)) : (long)(s.STANCE_DUR * 1000);
+  // long swing_ms  = (Log::sdReady()) ? Config::getInt("gait.swing_ms",  (long)(s.SWING_DUR  * 1000)) : (long)(s.SWING_DUR  * 1000);
+  // if (stance_ms < 50) stance_ms = 50; if (stance_ms > 2000) stance_ms = 2000;
+  // if (swing_ms  < 30) swing_ms  = 30; if (swing_ms  > 2000) swing_ms  = 2000;
+  // s.STANCE_DUR = stance_ms / 1000.0f;
+  // s.SWING_DUR  = swing_ms  / 1000.0f;
+  // for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) { s.L[leg].stance_dur = s.STANCE_DUR; s.L[leg].swing_dur = s.SWING_DUR; }
+  // Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
 
-  // Initial per-leg VSD
-  for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) set_vsd_for_leg(&s, leg);
 
-  s.loop_stamp_us = micros();
-  s.last_dt_loop = s.Ts;
-  ticker.begin(isr, (uint32_t)(1000000.0f / s.control_loop_Hz));  // start periodic ISR
-  Log::header();
+  // // Config management commands handled in handleCommandLineC()
+
+  // // Home angles
+  // if (Log::sdReady()) {
+  //   HomeCfg::ensureFile(s.home_cdeg, HOME_CFG_PATH);
+  //   HomeCfg::load(s.home_cdeg, HOME_CFG_PATH);
+  // }
+  // Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
+
+  // // // Initial per-leg VSD
+  // for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) set_vsd_for_leg(&s, leg);
+  // Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
+
+  // s.loop_stamp_us = micros();
+  // s.last_dt_loop = s.Ts;
+  // ticker.begin(isr, (uint32_t)(1000000.0f / s.control_loop_Hz));  // start periodic ISR
+  // Log::header();
+  // // Setup completed successfully; pet watchdog
+  // watchdog_pet();
+  // Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -1086,9 +1070,19 @@ void loop() {
   static elapsedMillis _memT;
   if (_memT > 5000) {
     _memT = 0;
-    Serial.printf("\n[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", freeHeapGap(), stackFreeNow(), maxHeapAllocTest());
+  Serial.printf("\n[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", mem_freeHeapGap(), mem_stackFreeNow(), mem_maxHeapAllocTest());
   }
 #endif
+
+  // Low-stack safeguard
+  static uint32_t min_stack_free = 0xFFFFFFFFu;
+  uint32_t sf = mem_stackFreeNow();
+  if (sf < min_stack_free) min_stack_free = sf;
+  if (mem_canary_ok() && sf > 0 && sf < 1024) {
+    Serial.print(R"([MEM] Low stack detected: )"); Serial.print(sf); Serial.println(R"( bytes free (<1024). Stopping gait and rebooting soon.)");
+    s.GAIT_RUN = false;
+    Log::setMode(Log::NONE);
+  }
 
   float log_temp = 0;
   float log_voltage = 0;
@@ -1118,172 +1112,177 @@ void loop() {
   if (!s.tickFlag) return;  // tick-gated: maintain deterministic cadence
   s.tickFlag = false;
 
-  const uint32_t now_us = micros();
-  const uint32_t loop_us = (uint32_t)(now_us - s.loop_stamp_us);
-  float dt_loop = (float)loop_us * 1e-6f;
-  if (!(dt_loop > 0.0f) || !isFinite(dt_loop) || dt_loop > 0.2f) dt_loop = s.Ts;  // guard bad/slow ticks
-  s.loop_stamp_us = now_us;
-  s.last_dt_loop = dt_loop;
+  // const uint32_t now_us = micros();
+  // const uint32_t loop_us = (uint32_t)(now_us - s.loop_stamp_us);
+  // float dt_loop = (float)loop_us * 1e-6f;
+  // s.loop_stamp_us = now_us;
+  // s.last_dt_loop = dt_loop;
+
+  // // Healthy progress -> pet watchdog
+  // watchdog_pet();
 
 
-  {
-    // Actual measurement this tick (single joint only)
-    // Enforce deterministic 1-read-per-tick via s.read_joint and incrementReadJoint().
-    // Guard against unexpected null pointers.
-    if (s.servos[s.read_joint]) {
-      log_temp = s.servos[s.read_joint]->temp();
-      log_voltage = s.servos[s.read_joint]->vin();
-      s.J[s.read_joint].temp = log_temp;
-      s.J[s.read_joint].vin = log_voltage;
-      // Update last seen bus telemetry for safety logic
-      g_last_tempC = (int16_t)log_temp;
-      g_last_mV    = (int16_t)log_voltage;
-      // Non-sticky hygiene: clear integrators if hot/low-V is observed
-      if ((g_last_tempC >= g_over_temp_c) || (g_last_mV > g_min_valid_mv && g_last_mV <= g_low_v_mv)) {
-        safetyClearIntegrators(&s);
-      }
+  // {
+  //   // Actual measurement this tick (single joint only)
+  //   // Enforce deterministic 1-read-per-tick via s.read_joint and incrementReadJoint().
+  //   // Guard against unexpected null pointers.
+  //   if (s.servos[s.read_joint]) {
+  //     log_temp = s.servos[s.read_joint]->temp();
+  //     log_voltage = s.servos[s.read_joint]->vin();
+  //     s.J[s.read_joint].temp = log_temp;
+  //     s.J[s.read_joint].vin = log_voltage;
+  //     // Update last seen bus telemetry for safety logic
+  //     g_last_tempC = (int16_t)log_temp;
+  //     g_last_mV    = (int16_t)log_voltage;
+  //     // Non-sticky hygiene: clear integrators if hot/low-V is observed
+  //     if ((g_last_tempC >= g_over_temp_c) || (g_last_mV > g_min_valid_mv && g_last_mV <= g_low_v_mv)) {
+  //       safetyClearIntegrators(&s);
+  //     }
 
-      int32_t cdeg = s.servos[s.read_joint]->pos_read();
-      s.J[s.read_joint].q_meas = cdeg_to_rad(cdeg);
-      if (!isFinite(s.J[s.read_joint].q_meas)) s.J[s.read_joint].q_meas = s.J[s.read_joint].q_est;
-    }
+  //     int32_t cdeg = s.servos[s.read_joint]->pos_read();
+  //     s.J[s.read_joint].q_meas = cdeg_to_rad(cdeg);
+  //     if (!isFinite(s.J[s.read_joint].q_meas)) s.J[s.read_joint].q_meas = s.J[s.read_joint].q_est;
+  //   }
 
-    if (!s.J[s.read_joint].has_meas) {
-      s.J[s.read_joint].has_meas = true;
-      s.J[s.read_joint].q_est    = s.J[s.read_joint].q_meas;
-      s.J[s.read_joint].dq_est   = 0.0f;
-      s.J[s.read_joint].dq_meas  = 0.0f;
-      s.J[s.read_joint].q_prev   = s.J[s.read_joint].q_meas;  // keep q_prev in sync for legacy paths
-    } else {
-      float dq_raw = (s.J[s.read_joint].q_meas - s.J[s.read_joint].q_est) / dt_loop;
-      if (!isFinite(dq_raw) || fabsf(dq_raw) > 200.0f) dq_raw = 0.0f;
-      s.J[s.read_joint].dq_est = lpf1(s.J[s.read_joint].dq_est, dq_raw, 0.20f);
-      s.J[s.read_joint].q_est  = s.J[s.read_joint].q_meas;
-      s.J[s.read_joint].dq_meas= s.J[s.read_joint].dq_est;
-      s.J[s.read_joint].q_prev = s.J[s.read_joint].q_meas;    // update q_prev here as well
-    }
-  s.incrementReadJoint();  // advance RR read pointer (1 joint/tick)
-  }
+  //   if (!s.J[s.read_joint].has_meas) {
+  //     s.J[s.read_joint].has_meas = true;
+  //     s.J[s.read_joint].q_est    = s.J[s.read_joint].q_meas;
+  //     s.J[s.read_joint].dq_est   = 0.0f;
+  //     s.J[s.read_joint].dq_meas  = 0.0f;
+  //     s.J[s.read_joint].q_prev   = s.J[s.read_joint].q_meas;  // keep q_prev in sync for legacy paths
+  //   } else {
+  //     float dq_raw = (s.J[s.read_joint].q_meas - s.J[s.read_joint].q_est) / dt_loop;
+  //     if (!isFinite(dq_raw) || fabsf(dq_raw) > 200.0f) dq_raw = 0.0f;
+  //     s.J[s.read_joint].dq_est = lpf1(s.J[s.read_joint].dq_est, dq_raw, 0.20f);
+  //     s.J[s.read_joint].q_est  = s.J[s.read_joint].q_meas;
+  //     s.J[s.read_joint].dq_meas= s.J[s.read_joint].dq_est;
+  //     s.J[s.read_joint].q_prev = s.J[s.read_joint].q_meas;    // update q_prev here as well
+  //   }
+  // s.incrementReadJoint();  // advance RR read pointer (1 joint/tick)
+  // }
 
-  // Advance gait and assign VSD bases
-  for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
-    auto& lp = s.L[leg];
-    if (s.GAIT_RUN) {
-      float ph_dur = (lp.phase == CS_LegPhase::STANCE) ? lp.stance_dur : lp.swing_dur;
-      lp.phase_t += dt_loop;
-      if (lp.phase_t >= ph_dur) {
-        lp.phase_t -= ph_dur;
-        lp.phase = (lp.phase == CS_LegPhase::STANCE) ? CS_LegPhase::SWING : CS_LegPhase::STANCE;
-      }
-    }
-    for (int dof = 0; dof < ControllerState::DOF_PER_LEG; ++dof) {
-      CS_VSD base = (lp.phase == CS_LegPhase::STANCE) ? s.VSD_STANCE_BASE[dof] : s.VSD_SWING_BASE[dof];
-      if (s.VSD_OVERRIDE_EN[dof]) base = s.VSD_OVERRIDE[dof];
-      s.J[leg * ControllerState::DOF_PER_LEG + dof].vsd = base;
-    }
-  }
+  // // Advance gait and assign VSD bases
+  // for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
+  //   auto& lp = s.L[leg];
+  //   if (s.GAIT_RUN) {
+  //     float ph_dur = (lp.phase == CS_LegPhase::STANCE) ? lp.stance_dur : lp.swing_dur;
+  //     lp.phase_t += dt_loop;
+  //     if (lp.phase_t >= ph_dur) {
+  //       lp.phase_t -= ph_dur;
+  //       lp.phase = (lp.phase == CS_LegPhase::STANCE) ? CS_LegPhase::SWING : CS_LegPhase::STANCE;
+  //     }
+  //   }
+  //   for (int dof = 0; dof < ControllerState::DOF_PER_LEG; ++dof) {
+  //     CS_VSD base = (lp.phase == CS_LegPhase::STANCE) ? s.VSD_STANCE_BASE[dof] : s.VSD_SWING_BASE[dof];
+  //     if (s.VSD_OVERRIDE_EN[dof]) base = s.VSD_OVERRIDE[dof];
+  //     s.J[leg * ControllerState::DOF_PER_LEG + dof].vsd = base;
+  //   }
+  // }
 
-  // NOTE: Removed duplicate RR read block; all joint telemetry reads are handled
-  // via s.read_joint above to guarantee exactly one read per tick.
+  // // NOTE: Removed duplicate RR read block; all joint telemetry reads are handled
+  // // via s.read_joint above to guarantee exactly one read per tick.
 
-  // Trajectory → IK → q_des (using provided IK with home offsets)
-  if (s.GAIT_RUN) {
-    for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
-      float xf, yf, zf;
-      footTrajectory_mm(&s, leg, &xf, &yf, &zf); // our frame: x=forward, y=lateral-left, z=up
-      int angles_cdeg[3];
-      // Map to user IK frame: x=lateral, y=vertical, z=forward
-      (void)calculateIK(leg, /*x*/ yf, /*y*/ zf, /*z*/ xf, angles_cdeg, s.home_cdeg);
-      const int j0 = leg * ControllerState::DOF_PER_LEG;
-      float qc = cdeg_to_rad(angles_cdeg[0]);
-      float qf = cdeg_to_rad(angles_cdeg[1]);
-      float qt = cdeg_to_rad(angles_cdeg[2]);
-      s.J[j0 + ControllerState::COXA ].q_des = sat(qc, s.J[j0 + ControllerState::COXA ].qmin, s.J[j0 + ControllerState::COXA ].qmax);
-      s.J[j0 + ControllerState::FEMUR].q_des = sat(qf, s.J[j0 + ControllerState::FEMUR].qmin, s.J[j0 + ControllerState::FEMUR].qmax);
-      s.J[j0 + ControllerState::TIBIA].q_des = sat(qt, s.J[j0 + ControllerState::TIBIA].qmin, s.J[j0 + ControllerState::TIBIA].qmax);
-    }
-  }
+  // // Trajectory → IK → q_des (using provided IK with home offsets)
+  // if (s.GAIT_RUN) {
+  //   for (int leg = 0; leg < ControllerState::N_LEGS; ++leg) {
+  //     float xf, yf, zf;
+  //     footTrajectory_mm(&s, leg, &xf, &yf, &zf); // our frame: x=forward, y=lateral-left, z=up
+  //     int angles_cdeg[3];
+  //     // Map to user IK frame: x=lateral, y=vertical, z=forward
+  //     (void)calculateIK(leg, /*x*/ yf, /*y*/ zf, /*z*/ xf, angles_cdeg, s.home_cdeg);
+  //     const int j0 = leg * ControllerState::DOF_PER_LEG;
+  //     float qc = cdeg_to_rad(angles_cdeg[0]);
+  //     float qf = cdeg_to_rad(angles_cdeg[1]);
+  //     float qt = cdeg_to_rad(angles_cdeg[2]);
+  //     s.J[j0 + ControllerState::COXA ].q_des = sat(qc, s.J[j0 + ControllerState::COXA ].qmin, s.J[j0 + ControllerState::COXA ].qmax);
+  //     s.J[j0 + ControllerState::FEMUR].q_des = sat(qf, s.J[j0 + ControllerState::FEMUR].qmin, s.J[j0 + ControllerState::FEMUR].qmax);
+  //     s.J[j0 + ControllerState::TIBIA].q_des = sat(qt, s.J[j0 + ControllerState::TIBIA].qmin, s.J[j0 + ControllerState::TIBIA].qmax);
+  //   }
+  // }
 
-  // Controllers → command
-  for (int j = 0; j < ControllerState::N_JOINTS; ++j) {
-    auto& X = s.J[j];
-    if (!X.enabled) continue;
-    if (g_safety_tripped) continue; // do not compute/emit commands when tripped
+  // // Controllers → command
+  // for (int j = 0; j < ControllerState::N_JOINTS; ++j) {
+  //   auto& X = s.J[j];
+  //   if (!X.enabled) continue;
+  //   if (g_safety_tripped) continue; // do not compute/emit commands when tripped
 
-    float err = X.q_des - X.q_meas;
-    float tau = X.vsd.ks * err - X.vsd.b * X.dq_meas + X.vsd.tau_des;
+  //   float err = X.q_des - X.q_meas;
+  //   float tau = X.vsd.ks * err - X.vsd.b * X.dq_meas + X.vsd.tau_des;
 
-    float derr = (X.q_meas - X.pid.x_prev) / dt_loop;
-    X.pid.x_prev = X.q_meas;
-  float u = X.pid.kp * err + X.pid.ki * X.pid.i_state - X.pid.kd * derr + tau;
+  //   float derr = (X.q_meas - X.pid.x_prev) / dt_loop;
+  //   X.pid.x_prev = X.q_meas;
+  // float u = X.pid.kp * err + X.pid.ki * X.pid.i_state - X.pid.kd * derr + tau;
 
-    float i_next = X.pid.i_state + err * dt_loop;
-    const float ICLAMP = 0.5f;
-    X.pid.i_state = sat(i_next, -ICLAMP, ICLAMP);
+  //   float i_next = X.pid.i_state + err * dt_loop;
+  //   const float ICLAMP = 0.5f;
+  //   X.pid.i_state = sat(i_next, -ICLAMP, ICLAMP);
 
-  float q_cmd = sat(X.q_meas + sat(u, -X.dqmax * dt_loop, X.dqmax * dt_loop), X.qmin, X.qmax);
-  const int32_t cdeg = rad_to_cdeg(q_cmd);
-  X.q_cmd = q_cmd;
-  X.u_out = u;
+  // float q_cmd = sat(X.q_meas + sat(u, -X.dqmax * dt_loop, X.dqmax * dt_loop), X.qmin, X.qmax);
+  // const int32_t cdeg = rad_to_cdeg(q_cmd);
+  // X.q_cmd = q_cmd;
+  // X.u_out = u;
 
-    // NOTE: still commented per your code
-    // X.srv->move_time(cdeg, (int)(s.Ts * 1000));
-  }
+  //   // NOTE: still commented per your code
+  //   // X.srv->move_time(cdeg, (int)(s.Ts * 1000));
+  // }
 
-  // Evaluate sticky safety trip after reading latest telemetry
-  if (!g_safety_tripped) {
-    if (g_last_tempC >= g_over_temp_c) {
-      safetyTrip(&s, "over-temp");
-    } else if (g_last_mV > g_min_valid_mv && g_last_mV <= g_low_v_mv) {
-      safetyTrip(&s, "low-bus-voltage");
-    }
-  }
+  // // Evaluate sticky safety trip after reading latest telemetry
+  // if (!g_safety_tripped) {
+  //   if (g_last_tempC >= g_over_temp_c) {
+  //     safetyTrip(&s, "over-temp");
+  //   } else if (g_last_mV > g_min_valid_mv && g_last_mV <= g_low_v_mv) {
+  //     safetyTrip(&s, "low-bus-voltage");
+  //   }
+  // }
 
-  // create a log row (cycle-based cadence)
-  if (++s.log_cycle_counter >= s.log_every_cycles) {
+  // // create a log row (cycle-based cadence)
+  // if (++s.log_cycle_counter >= s.log_every_cycles) {
 
-    //    float dt_loop,
-    //    int read_idx, int leg_idx, uint8_t joint_id,
-    //    float q_meas, float dq_meas,
-    //    int16_t tempC, int16_t mV,
-    //    float q_cmd, float q_ref, float e,
-    //    const char* phase_str, float u
-    const int jidx = (int)((s.read_joint == 0) ? ControllerState::N_JOINTS - 1 : s.read_joint - 1);
-    const int leg_idx = jidx / ControllerState::DOF_PER_LEG;
-    const uint8_t joint_id = (uint8_t)(jidx % ControllerState::DOF_PER_LEG);
-    // Compute foot kinematics for this leg/joint row
-    float fx_mm=0, fy_mm=0, fz_mm=0; int ik_ok=0; float phase_u=0;
-    {
-      float xf, yf, zf;
-      footTrajectory_mm(&s, leg_idx, &xf, &yf, &zf);
-      // Map to user IK frame to match logging axes
-      fx_mm = yf; fy_mm = zf; fz_mm = xf;
-      int tmp[3];
-      ik_ok = calculateIK(leg_idx, /*x*/ yf, /*y*/ zf, /*z*/ xf, tmp, s.home_cdeg) ? 1 : 0;
-      const auto& lp = s.L[leg_idx];
-      const float ph_dur = (lp.phase == CS_LegPhase::STANCE) ? lp.stance_dur : lp.swing_dur;
-      phase_u = (ph_dur > 1e-6f) ? sat(lp.phase_t / ph_dur, 0.0f, 1.0f) : 0.0f;
-    }
+  //   //    float dt_loop,
+  //   //    int read_idx, int leg_idx, uint8_t joint_id,
+  //   //    float q_meas, float dq_meas,
+  //   //    int16_t tempC, int16_t mV,
+  //   //    float q_cmd, float q_ref, float e,
+  //   //    const char* phase_str, float u
+  //   const int jidx = (int)((s.read_joint == 0) ? ControllerState::N_JOINTS - 1 : s.read_joint - 1);
+  //   const int leg_idx = jidx / ControllerState::DOF_PER_LEG;
+  //   const uint8_t joint_id = (uint8_t)(jidx % ControllerState::DOF_PER_LEG);
+  //   // Compute foot kinematics for this leg/joint row
+  //   float fx_mm=0, fy_mm=0, fz_mm=0; int ik_ok=0; float phase_u=0;
+  //   {
+  //     float xf, yf, zf;
+  //     footTrajectory_mm(&s, leg_idx, &xf, &yf, &zf);
+  //     // Map to user IK frame to match logging axes
+  //     fx_mm = yf; fy_mm = zf; fz_mm = xf;
+  //     int tmp[3];
+  //     ik_ok = calculateIK(leg_idx, /*x*/ yf, /*y*/ zf, /*z*/ xf, tmp, s.home_cdeg) ? 1 : 0;
+  //     const auto& lp = s.L[leg_idx];
+  //     const float ph_dur = (lp.phase == CS_LegPhase::STANCE) ? lp.stance_dur : lp.swing_dur;
+  //     phase_u = (ph_dur > 1e-6f) ? sat(lp.phase_t / ph_dur, 0.0f, 1.0f) : 0.0f;
+  //   }
 
-    Log::row(
-      s.loop_stamp_us,
-      loop_us,
-      dt_loop,
-      jidx,
-      leg_idx,
-      joint_id,
-      s.J[jidx].q_meas,
-      s.J[jidx].dq_meas,
-      s.J[jidx].q_est,
-      s.J[jidx].dq_est,
-      (int16_t)s.J[jidx].temp,
-      (int16_t)s.J[jidx].vin,
-      s.J[jidx].q_cmd,
-      s.J[jidx].q_des,
-      s.J[jidx].q_des - s.J[jidx].q_meas,
-      (s.L[leg_idx].phase == CS_LegPhase::STANCE ? "STANCE" : "SWING"),
-      s.J[jidx].u_out,
-      fx_mm, fy_mm, fz_mm, ik_ok, phase_u);
-    s.log_cycle_counter = 0;
-  }
+  //   Log::row(
+  //     s.loop_stamp_us,
+  //     loop_us,
+  //     dt_loop,
+  //     jidx,
+  //     leg_idx,
+  //     joint_id,
+  //     s.J[jidx].q_meas,
+  //     s.J[jidx].dq_meas,
+  //     s.J[jidx].q_est,
+  //     s.J[jidx].dq_est,
+  //     (int16_t)s.J[jidx].temp,
+  //     (int16_t)s.J[jidx].vin,
+  //     s.J[jidx].q_cmd,
+  //     s.J[jidx].q_des,
+  //     s.J[jidx].q_des - s.J[jidx].q_meas,
+  //     (s.L[leg_idx].phase == CS_LegPhase::STANCE ? "STANCE" : "SWING"),
+  //     s.J[jidx].u_out,
+  //     fx_mm, fy_mm, fz_mm, ik_ok, phase_u);
+  //   s.log_cycle_counter = 0;
+  // }
+
+  // // End-of-loop watchdog check
+  // watchdog_check_and_maybe_reboot();
 }
