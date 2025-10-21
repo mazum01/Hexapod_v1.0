@@ -72,7 +72,7 @@
 #include <malloc.h>
 #include "Hexapod_v1.0.h"
 #include "Logging.h"
-#include <CrashReport.h>
+//#include <CrashReport.h>
 #include <new>        // placement new
 #include "ControllerState.h"
 #include "Config.h"
@@ -83,6 +83,23 @@
 #ifndef MEM_GAUGES_BOOT_PRINTS
 #define MEM_GAUGES_BOOT_PRINTS 0
 #endif
+
+// Enable lightweight USB diagnostics (LED + Serial1) to help debug enumeration.
+#ifndef USB_DIAG
+#define USB_DIAG 1
+#endif
+
+static inline void diag_blink(int n, int on_ms = 40, int off_ms = 120) {
+#if USB_DIAG
+  pinMode(LED_BUILTIN, OUTPUT);
+  for (int i = 0; i < n; ++i) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(on_ms);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(off_ms);
+  }
+#endif
+}
 
 // IntelliSense-only fallback for strtok_r to silence parser squiggles.
 // Teensy/newlib provides strtok_r at build time; this shim is ignored by the compiler.
@@ -956,10 +973,23 @@ static void set_vsd_for_leg(ControllerState* cs, int leg_index) {
 // ───────────────────────────────────────────────────────────────────────────────
 
 void setup() {
-  delay(1000); // wait for power to stabilize
+  // Minimal delays only; avoid heavy work before USB enumerates.
+  diag_blink(3);
+  delay(300); // let power settle a bit
+  Serial1.begin(115200);
   Serial.begin(0);
-  //uint32_t t0 = millis(); while (!Serial && (millis() - t0) < 5000) {}
-  delay(1000);
+  // Optional: wait briefly for USB host (don't block hard)
+  uint32_t t0 = millis();
+  while (!Serial && (millis() - t0) < 1200) { /* spin */ }
+
+#if USB_DIAG
+  Serial1.println("[DIAG] setup: entered");
+  if (CrashReport) {
+    Serial1.println("[DIAG] CrashReport detected. Dumping:");
+    Serial1.print(CrashReport);
+    CrashReport.clear();
+  }
+#endif
 //     // CrashReport (Teensy): print any prior crash info for diagnostics
 //   if (CrashReport) {
 //     Serial.println(R"(
@@ -997,6 +1027,12 @@ void setup() {
 #if MEM_GAUGES_BOOT_PRINTS
   Serial.printf("[MEM] canary window = %u bytes\n", mem_canary_window());
   Serial.printf("[MEM] heap_top=%p sp_init=%p freeGap=%u\n", (void*)mem_heap_top_addr(), (void*)mem_sp_init_addr(), mem_freeHeapGap());
+#endif
+  diag_blink(2);
+  
+  // Signal end of setup
+#if USB_DIAG
+  Serial1.println("[DIAG] setup: done");
 #endif
 
   // s.initDefaults();
@@ -1084,6 +1120,13 @@ void loop() {
     s.GAIT_RUN = false;
     Log::setMode(Log::NONE);
   }
+
+#if USB_DIAG
+  // LED heartbeat (toggle every ~500ms) to confirm the loop runs even without USB
+  static elapsedMillis _hb;
+  static bool _led = false;
+  if (_hb > 500) { _hb = 0; _led = !_led; digitalWrite(LED_BUILTIN, _led ? HIGH : LOW); }
+#endif
 
   float log_temp = 0;
   float log_voltage = 0;
