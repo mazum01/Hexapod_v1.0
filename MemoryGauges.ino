@@ -29,6 +29,12 @@ static uint32_t freeHeapGap_impl() {
   return (sp > heap_top) ? (uint32_t)(sp - heap_top) : 0u;
 }
 
+// Set MEM_GAUGES_CANARY to 1 to enable writing a canary between heap and stack.
+// Default is 0 to avoid touching allocator-managed memory at boot (safer for USB).
+#ifndef MEM_GAUGES_CANARY
+#define MEM_GAUGES_CANARY 0
+#endif
+
 void stackCanaryInit() {
   __canary_ok            = false;
   __canary_painted_bytes = 0;
@@ -63,6 +69,8 @@ void stackCanaryInit() {
   }
 
   __canary_start = base;
+
+#if MEM_GAUGES_CANARY
   // Paint only a limited portion to avoid long blocking or touching reserved areas.
   const size_t PAINT_LIMIT = 16 * 1024; // 16 KB max to paint for safety
   size_t paint_bytes = window;
@@ -75,6 +83,13 @@ void stackCanaryInit() {
 
   __canary_ok            = true;
   __canary_painted_bytes = (uint32_t)paint_bytes;
+#else
+  // Canary disabled: don't write into RAM. Report zero window and keep canary off.
+  __canary_start = nullptr;
+  __canary_end   = nullptr;
+  __canary_ok    = false;
+  __canary_painted_bytes = 0;
+#endif
 }
 
 static uint32_t stackFreeNow_impl() {

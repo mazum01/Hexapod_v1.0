@@ -990,13 +990,8 @@ void setup() {
   
   stackCanaryInit();
   Serial.printf("[MEM] canary window = %u bytes\n", mem_canary_window());
-  if (!mem_canary_ok()) {
-    Serial.println(R"([MEM] canary not initialized; heap/stack too close. Diagnostics:)");
-    Serial.printf("[MEM] heap_top=%p sp_init=%p freeGap=%u\n", (void*)mem_heap_top_addr(), (void*)mem_sp_init_addr(), mem_freeHeapGap());
-  } else {
-    Serial.printf("[MEM] heap_top=%p sp_init=%p freeGap=%u\n", (void*)mem_heap_top_addr(), (void*)mem_sp_init_addr(), mem_freeHeapGap());
-  }
-  Serial.printf("[MEM] freeGap=%u stackFree=%u maxAlloc=%u\n", mem_freeHeapGap(), mem_stackFreeNow(), mem_maxHeapAllocTest());
+  Serial.printf("[MEM] heap_top=%p sp_init=%p freeGap=%u\n", (void*)mem_heap_top_addr(), (void*)mem_sp_init_addr(), mem_freeHeapGap());
+  Serial.printf("[MEM] freeGap=%u maxAlloc=%u\n", mem_freeHeapGap(), mem_maxHeapAllocTest());
 
   // s.initDefaults();
   // printStartupInfo(&s);
@@ -1075,11 +1070,11 @@ void loop() {
 #endif
 
   // Low-stack safeguard
-  static uint32_t min_stack_free = 0xFFFFFFFFu;
-  uint32_t sf = mem_stackFreeNow();
-  if (sf < min_stack_free) min_stack_free = sf;
-  if (mem_canary_ok() && sf > 0 && sf < 1024) {
-    Serial.print(R"([MEM] Low stack detected: )"); Serial.print(sf); Serial.println(R"( bytes free (<1024). Stopping gait and rebooting soon.)");
+  static uint32_t min_free_gap = 0xFFFFFFFFu;
+  uint32_t fg = mem_freeHeapGap();
+  if (fg < min_free_gap) min_free_gap = fg;
+  if (fg > 0 && fg < 4096) {
+    Serial.print(R"([MEM] Low RAM gap detected: )"); Serial.print(fg); Serial.println(R"( bytes free (<4096). Stopping gait and rebooting soon.)");
     s.GAIT_RUN = false;
     Log::setMode(Log::NONE);
   }
